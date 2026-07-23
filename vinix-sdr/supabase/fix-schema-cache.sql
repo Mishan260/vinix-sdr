@@ -1,0 +1,26 @@
+-- ============================================================================
+-- ⚠️ OBSOLETO — NO EJECUTAR. Sustituido por migrations/0005_reconcile_schema.sql
+--
+-- Este archivo añadía las columnas follow_up_enabled / follow_up_days /
+-- max_follow_ups, que resultaron ser los nombres EQUIVOCADOS. Ejecutarlo hoy
+-- volvería a crear columnas duplicadas y dejaría dos fuentes de verdad.
+--
+-- Los nombres canónicos son los que tiene la tabla `campaigns` real:
+--     followups_enabled  ·  followup_delay_days  ·  followup_max_touches
+--
+-- ----------------------------------------------------------------------------
+-- Sobre el error "Could not find the 'X' column of 'campaigns' in the schema
+-- cache" (PGRST204): el mensaje culpa al cache, pero PostgREST lo devuelve
+-- IGUAL cuando la columna sencillamente no existe. Antes de recargar nada,
+-- comprueba si la columna está:
+--
+--     select column_name
+--       from information_schema.columns
+--      where table_schema = 'public' and table_name = 'campaigns'
+--      order by column_name;
+--
+--   • ¿NO aparece en la lista?  → es un desajuste de esquema.
+--                                 Ejecuta migrations/0005_reconcile_schema.sql
+--   • ¿SÍ aparece?              → entonces sí es el cache. Recárgalo:
+--                                 notify pgrst, 'reload schema';
+-- ============================================================================
