@@ -27,6 +27,7 @@ export const POST = authedRoute(
   { event: "campaigns.create", body: createCampaignSchema, rateLimit: "mutation" },
   async ({ body, db, user, log }) => {
     const state = await loadAccount(db, user.id);
+    console.log("ACCOUNT STATE:", JSON.stringify(state, null, 2));
     assertCanCreateCampaign(state);
 
     const { data, error } = await db
