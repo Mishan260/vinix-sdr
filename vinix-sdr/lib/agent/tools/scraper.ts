@@ -8,6 +8,27 @@
 
 import { completeJSON } from "../llm";
 import { RESEARCH_PROMPT } from "../prompts";
+import { TtlCache, ttlFromEnv } from "@/lib/cache/ttl-cache";
+
+// ── Cachés de investigación ─────────────────────────────────────────────────
+// El contenido de una web pública no depende del usuario que la consulta, así
+// que es seguro compartirlo entre cuentas. TTL configurable: 24 h por defecto,
+// suficiente para cubrir un lote y un par de reintentos sin servir datos rancios.
+const scrapeCache = new TtlCache<string>({
+  name: "scrape",
+  ttlMs: ttlFromEnv("RESEARCH_CACHE_TTL_HOURS", 24),
+  maxEntries: 300,
+});
+
+/** Estadísticas de la caché de scraping, para /api/health. */
+export function scrapeCacheStats() {
+  return scrapeCache.stats();
+}
+
+/** Vacía la caché. Sólo para tests. */
+export function resetScrapeCache() {
+  scrapeCache.clear();
+}
 
 export interface ResearchInput {
   companyName: string;
@@ -165,12 +186,19 @@ export async function researchCompany(input: ResearchInput): Promise<ResearchOut
   }
 
   // 1. Scraping (Firecrawl → fallback fetch)
+  //
+  // El contenido de una web pública es el mismo para todos: se cachea por URL
+  // normalizada. Evita pagar dos veces por Firecrawl cuando varios leads
+  // comparten dominio (matriz y filiales, o el mismo lead reintentado tras un
+  // fallo de redacción) y deduplica las peticiones concurrentes de un lote.
   let content: string;
   try {
-    const firecrawlKey = process.env.FIRECRAWL_API_KEY;
-    content = firecrawlKey
-      ? await scrapeWithFirecrawl(url.href, firecrawlKey)
-      : await scrapeWithFetch(url.href);
+    content = await scrapeCache.getOrSet(url.href, async () => {
+      const firecrawlKey = process.env.FIRECRAWL_API_KEY;
+      return firecrawlKey
+        ? await scrapeWithFirecrawl(url.href, firecrawlKey)
+        : await scrapeWithFetch(url.href);
+    });
   } catch (err) {
     const msg = (err as Error).name === "AbortError"
       ? `Timeout de scraping (${SCRAPE_TIMEOUT_MS}ms)`

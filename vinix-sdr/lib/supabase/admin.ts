@@ -11,15 +11,17 @@
 // aunque el código de la ruta olvide un `.eq("user_id", …)`.
 // ============================================================================
 
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createClient } from "@supabase/supabase-js";
 import { getEnv } from "@/lib/env";
+import type { Database } from "./database.types";
+import type { TypedSupabaseClient } from "./types";
 
-let cached: SupabaseClient | null = null;
+let cached: TypedSupabaseClient | null = null;
 
-export function createServiceClient(): SupabaseClient {
+export function createServiceClient(): TypedSupabaseClient {
   if (cached) return cached;
   const env = getEnv();
-  cached = createClient(env.supabaseUrl, env.SUPABASE_SERVICE_ROLE_KEY, {
+  cached = createClient<Database>(env.supabaseUrl, env.SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
   return cached;

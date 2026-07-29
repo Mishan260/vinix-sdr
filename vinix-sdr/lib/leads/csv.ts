@@ -147,7 +147,15 @@ export function csvField(value: unknown): string {
 /** BOM UTF-8: hace que Excel abra el CSV con acentos y ñ correctos. */
 const UTF8_BOM = "﻿";
 
-export function toCsv(headers: string[], rows: Record<string, unknown>[]): string {
-  const lines = [headers.join(","), ...rows.map((r) => headers.map((h) => csvField(r[h])).join(","))];
+/**
+ * Serializa filas a CSV.
+ * El genérico acepta cualquier objeto (incluidas las filas tipadas que devuelve
+ * Supabase) sin necesidad de castear a Record<string, unknown>.
+ */
+export function toCsv<T extends object>(headers: readonly string[], rows: readonly T[]): string {
+  const lines = [
+    headers.join(","),
+    ...rows.map((row) => headers.map((h) => csvField((row as Record<string, unknown>)[h])).join(",")),
+  ];
   return UTF8_BOM + lines.join("\r\n");
 }

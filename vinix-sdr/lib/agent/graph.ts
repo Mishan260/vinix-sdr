@@ -7,11 +7,12 @@
 // Las llamadas al LLM van vía lib/agent/llm.ts (reintentos + timeout).
 // ============================================================================
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TypedSupabaseClient } from "@/lib/supabase/types";
 import { createServiceClient } from "@/lib/supabase/admin";
 import { researchCompany } from "./tools/scraper";
 import { completeJSON } from "./llm";
 import { DRAFT_PROMPT, CLASSIFY_PROMPT } from "./prompts";
+import { requireOne } from "@/lib/supabase/relations";
 import { errors } from "@/lib/errors";
 import { logger } from "@/lib/logger";
 
@@ -86,23 +87,23 @@ export async function researchAndDraft({
   db = createServiceClient(),
 }: {
   leadId: string;
-  db?: SupabaseClient;
+  db?: TypedSupabaseClient;
 }): Promise<ResearchAndDraftResult> {
-  // 1. Cargar lead + configuración de campaña
+  // 1. Cargar lead + configuración de campaña.
+  //
+  // Se piden sólo las columnas que se usan. Con `select("*")` venía también
+  // `research_raw` —hasta 8 KB del contenido scrapeado de una investigación
+  // anterior— y los borradores, en cada iteración del lote de investigación.
   const { data: lead, error: leadError } = await db
     .from("leads")
-    .select("*, campaigns(base_template, value_proposition, sender_name)")
+    .select("id, company_name, company_url, contact_name, campaigns(base_template, value_proposition, sender_name)")
     .eq("id", leadId)
     .maybeSingle();
 
   if (leadError) throw errors.internal(leadError);
   if (!lead) throw errors.notFound("El lead");
 
-  const campaign = lead.campaigns as unknown as {
-    base_template: string;
-    value_proposition: string;
-    sender_name: string;
-  };
+  const campaign = requireOne(lead.campaigns, "campaigns del lead");
 
   await db.from("leads").update({ status: "researching" }).eq("id", leadId);
 
@@ -123,7 +124,7 @@ export async function researchAndDraft({
 }
 
 async function runPipeline(
-  db: SupabaseClient,
+  db: TypedSupabaseClient,
   leadId: string,
   lead: { company_name: string; company_url: string | null; contact_name: string | null },
   campaign: { base_template: string; value_proposition: string; sender_name: string }

@@ -7,8 +7,9 @@
 // curso". Un cambio de política tenía que replicarse en 4 sitios.
 // ============================================================================
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TypedSupabaseClient } from "@/lib/supabase/types";
 import { errors } from "@/lib/errors";
+import { logger } from "@/lib/logger";
 import {
   resolvePlan,
   FALLBACK_ACCOUNT,
@@ -30,49 +31,86 @@ export interface AccountState {
   eligibleForTrial: boolean;
 }
 
-/** Inicio del mes natural en curso, en UTC. */
+/**
+ * Inicio del mes natural en curso, en UTC.
+ *
+ * El recuento de leads del mes lo hace ahora Postgres dentro de
+ * `account_overview()`, pero esta función define la convención que esa consulta
+ * debe reproducir (`date_trunc('month', now() at time zone 'UTC')`). Los tests
+ * la usan para fijar el límite esperado: si alguien cambia la zona horaria en
+ * el SQL, el desajuste se detecta aquí.
+ */
 export function monthStart(now: Date = new Date()): Date {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
 }
 
-export async function loadAccount(db: SupabaseClient, userId: string): Promise<AccountState> {
-  const [accountResult, campaignsResult, leadsResult, subscriptionResult] = await Promise.all([
-    db.from("accounts").select("user_id, plan, billing_cycle, trial_ends_at, stripe_customer_id").eq("user_id", userId).maybeSingle(),
-    db.from("campaigns").select("id", { count: "exact", head: true }).eq("user_id", userId),
-    countLeadsThisMonth(db, userId),
-    db.from("subscriptions").select("id", { count: "exact", head: true }).eq("user_id", userId),
-  ]);
+/**
+ * Plan efectivo y uso del mes de un usuario.
+ *
+ * RENDIMIENTO: una única llamada a la función SQL `account_overview`
+ * (migración 0006). La versión anterior hacía 5 round-trips —uno de ellos
+ * duplicado sobre `campaigns`— y esta función se invoca en 5 endpoints, así
+ * que su coste multiplicaba todo el tráfico de escritura de la plataforma.
+ *
+ * El recuento de leads del mes se resuelve en Postgres con un join sobre
+ * `campaigns`, lo que además elimina el patrón `.in("campaign_id", [...ids])`
+ * que metía cientos de UUID en la query string y podía exceder el límite de
+ * longitud de la URL en cuentas con muchas campañas.
+ */
+export async function loadAccount(db: TypedSupabaseClient, userId: string): Promise<AccountState> {
+  const { data, error } = await db.rpc("account_overview", { p_user_id: userId });
 
-  const account = (accountResult.data as AccountRow | null) ?? null;
+  if (error) {
+    logger.error("billing.account.overview_failed", {
+      userId,
+      dbError: error.message,
+      dbErrorCode: error.code,
+      solucion: "aplicar supabase/migrations/0006_account_overview.sql",
+    });
+    throw errors.internal(error);
+  }
+
+  // La función devuelve siempre exactamente una fila (LEFT JOIN sobre un ancla)
+  const overview = Array.isArray(data) ? data[0] : data;
+
+  if (!overview) {
+    logger.error("billing.account.overview_empty", {
+      userId,
+      impacto: "no se pudo determinar el plan; se aplica el más restrictivo",
+    });
+    return {
+      effective: resolvePlan(FALLBACK_ACCOUNT),
+      usage: { campaigns: 0, leadsThisMonth: 0 },
+      stripeCustomerId: null,
+      eligibleForTrial: true,
+    };
+  }
+
+  // `plan` llega como 'free' cuando no existe fila en `accounts`. Distinguir
+  // ese caso importa: significa que el alta automática no se ejecutó, y sin
+  // aviso se traduce en un 402 "no puedes crear campañas" indescifrable.
+  if (!overview.stripe_customer_id && overview.plan === "free" && overview.campaigns_count > 0) {
+    logger.warn("billing.account.possibly_missing_row", {
+      userId,
+      campaigns: overview.campaigns_count,
+      impacto: "plan Free con campañas ya creadas; revisar que exista la fila en accounts",
+    });
+  }
+
+  const account: Pick<AccountRow, "plan" | "trial_ends_at"> = {
+    plan: overview.plan as AccountRow["plan"],
+    trial_ends_at: overview.trial_ends_at,
+  };
 
   return {
-    effective: resolvePlan(account ?? FALLBACK_ACCOUNT),
+    effective: resolvePlan(account),
     usage: {
-      campaigns: campaignsResult.count ?? 0,
-      leadsThisMonth: leadsResult,
+      campaigns: overview.campaigns_count ?? 0,
+      leadsThisMonth: overview.leads_this_month ?? 0,
     },
-    stripeCustomerId: account?.stripe_customer_id ?? null,
-    eligibleForTrial: (subscriptionResult.count ?? 0) === 0,
+    stripeCustomerId: overview.stripe_customer_id ?? null,
+    eligibleForTrial: !overview.has_subscription,
   };
-}
-
-/**
- * Leads creados este mes por el usuario.
- * Se cuenta con un join implícito sobre campaigns porque `leads` no guarda
- * user_id: la propiedad es transitiva a través de la campaña.
- */
-async function countLeadsThisMonth(db: SupabaseClient, userId: string): Promise<number> {
-  const { data: campaigns } = await db.from("campaigns").select("id").eq("user_id", userId);
-  const ids = (campaigns ?? []).map((c) => c.id as string);
-  if (ids.length === 0) return 0;
-
-  const { count } = await db
-    .from("leads")
-    .select("id", { count: "exact", head: true })
-    .in("campaign_id", ids)
-    .gte("created_at", monthStart().toISOString());
-
-  return count ?? 0;
 }
 
 // ── Comprobaciones de límite: lanzan AppError 402 con mensaje accionable ────

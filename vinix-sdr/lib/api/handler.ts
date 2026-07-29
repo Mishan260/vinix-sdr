@@ -14,7 +14,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import type { SupabaseClient, User } from "@supabase/supabase-js";
+import type { User } from "@supabase/supabase-js";
+import type { TypedSupabaseClient } from "@/lib/supabase/types";
 import { z } from "zod";
 import { logger, type Logger, captureException } from "@/lib/logger";
 import { AppError, toAppError, toErrorBody, errors } from "@/lib/errors";
@@ -50,7 +51,7 @@ export interface HandlerContext<TBody, TQuery> {
 export interface AuthedContext<TBody, TQuery> extends HandlerContext<TBody, TQuery> {
   user: User;
   /** Cliente Supabase con la sesión del usuario: todas las consultas pasan por RLS. */
-  db: SupabaseClient;
+  db: TypedSupabaseClient;
 }
 
 interface BaseOptions<TBodySchema extends z.ZodTypeAny, TQuerySchema extends z.ZodTypeAny> {

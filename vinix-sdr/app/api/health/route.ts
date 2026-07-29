@@ -10,6 +10,8 @@ import { describeEnvHealth, getEnvSafe } from "@/lib/env";
 import { createServiceClient } from "@/lib/supabase/admin";
 import { publicRoute } from "@/lib/api/handler";
 import { isStripeConfigured } from "@/lib/billing/stripe";
+import { llmCacheStats } from "@/lib/agent/llm";
+import { scrapeCacheStats } from "@/lib/agent/tools/scraper";
 
 export const dynamic = "force-dynamic";
 
@@ -62,6 +64,13 @@ export const GET = publicRoute({ event: "health", rateLimit: "read" }, async ({ 
       inboundWebhook: Boolean(env?.RESEND_WEBHOOK_SECRET),
       billing: isStripeConfigured(),
       firecrawl: Boolean(env?.FIRECRAWL_API_KEY),
+    },
+    // Aciertos de caché de esta instancia. Una tasa alta en `scrape` significa
+    // llamadas a Firecrawl que no se han pagado; en `llm`, tokens ahorrados.
+    // Los contadores son por instancia y se reinician en cada arranque en frío.
+    caches: {
+      scrape: scrapeCacheStats(),
+      llm: llmCacheStats(),
     },
   });
 });

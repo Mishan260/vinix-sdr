@@ -22,8 +22,24 @@ export const config = {
   matcher: ["/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)"],
 };
 
-/** Rutas accesibles sin sesión. */
-const PUBLIC_PATHS = ["/login", "/signup", "/forgot-password", "/reset-password", "/auth/callback", "/auth/signout"];
+/**
+ * Rutas accesibles sin sesión.
+ *
+ * `/` y `/pricing` son páginas de marketing: tienen que ser rastreables por
+ * Google y visibles para quien todavía no es cliente. Antes `/` redirigía al
+ * panel, así que no había absolutamente nada público que indexar ni que
+ * enseñar a un cliente potencial.
+ */
+const PUBLIC_PATHS = [
+  "/",
+  "/pricing",
+  "/login",
+  "/signup",
+  "/forgot-password",
+  "/reset-password",
+  "/auth/callback",
+  "/auth/signout",
+];
 
 /** Rutas de API que se autentican por firma o secreto, no por sesión de usuario. */
 const UNPROTECTED_API = [
@@ -33,8 +49,12 @@ const UNPROTECTED_API = [
 ];
 
 function isPublicPath(pathname: string): boolean {
-  return PUBLIC_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
+  // "/" se compara exacto: con startsWith("/") todo sería público
+  return PUBLIC_PATHS.some((p) => pathname === p || (p !== "/" && pathname.startsWith(`${p}/`)));
 }
+
+/** Archivos que generan los metadatos de Next y deben servirse sin sesión. */
+const PUBLIC_FILES = ["/sitemap.xml", "/robots.txt", "/opengraph-image", "/icon", "/favicon.ico"];
 
 function isUnprotectedApi(pathname: string): boolean {
   return UNPROTECTED_API.some((p) => pathname === p || pathname.startsWith(`${p}/`));
@@ -44,6 +64,7 @@ export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
   if (isUnprotectedApi(pathname)) return NextResponse.next();
+  if (PUBLIC_FILES.some((f) => pathname === f || pathname.startsWith(`${f}/`))) return NextResponse.next();
 
   // Vercel Cron se identifica con el secreto, no con una sesión de navegador
   const cronSecret = process.env.CRON_SECRET;
@@ -76,7 +97,9 @@ export async function middleware(req: NextRequest) {
   // getSession() se fía de la cookie, que un atacante puede falsificar.
   const { data: { user } } = await supabase.auth.getUser();
 
-  // Con sesión activa, las pantallas de login/registro no tienen sentido
+  // Con sesión activa, las pantallas de login/registro no tienen sentido.
+  // La landing y los precios sí se dejan ver: un cliente puede querer
+  // consultar los planes sin cerrar sesión.
   if (user && (pathname === "/login" || pathname === "/signup")) {
     return NextResponse.redirect(new URL("/dashboard", req.url));
   }

@@ -86,6 +86,69 @@ export class ConfigError extends Error {
 
 let cache: ServerEnv | null = null;
 
+// ── Coherencia entre la URL y las claves ────────────────────────────────────
+// Las claves de Supabase son JWT que llevan dentro el `ref` del proyecto al
+// que pertenecen. Si alguien cambia SUPABASE_URL a otro proyecto y olvida
+// cambiar las claves, la app arranca sin error aparente y PostgREST responde
+// 401 "Invalid API key" a TODA consulta: el panel se ve vacío o roto sin que
+// nada explique por qué. Comparar ambos refs convierte ese fallo silencioso
+// en un mensaje inequívoco.
+
+/** Extrae el `ref` del proyecto de una clave JWT de Supabase. */
+export function projectRefFromKey(key: string | undefined): string | null {
+  if (!key) return null;
+  const parts = key.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64").toString("utf8")) as { ref?: string };
+    return typeof payload.ref === "string" ? payload.ref : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Extrae el `ref` del proyecto de la URL (https://<ref>.supabase.co). */
+export function projectRefFromUrl(url: string | undefined): string | null {
+  if (!url) return null;
+  try {
+    const host = new URL(url).hostname;
+    if (!host.endsWith(".supabase.co")) return null;
+    return host.split(".")[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+export interface RefMismatch {
+  key: string;
+  urlRef: string;
+  keyRef: string;
+}
+
+/**
+ * Devuelve las claves cuyo proyecto no coincide con el de SUPABASE_URL.
+ * Vacío si todo es coherente (o si no se puede determinar, p. ej. en tests
+ * con claves sintéticas).
+ */
+export function findProjectRefMismatches(source: Record<string, string | undefined>): RefMismatch[] {
+  const url = cleaned(source.SUPABASE_URL) ?? cleaned(source.NEXT_PUBLIC_SUPABASE_URL);
+  const urlRef = projectRefFromUrl(url as string | undefined);
+  if (!urlRef) return [];
+
+  const candidates: [string, string | undefined][] = [
+    ["SUPABASE_SERVICE_ROLE_KEY", cleaned(source.SUPABASE_SERVICE_ROLE_KEY) as string | undefined],
+    ["NEXT_PUBLIC_SUPABASE_ANON_KEY", cleaned(source.NEXT_PUBLIC_SUPABASE_ANON_KEY) as string | undefined],
+    ["SUPABASE_ANON_KEY", cleaned(source.SUPABASE_ANON_KEY) as string | undefined],
+  ];
+
+  const mismatches: RefMismatch[] = [];
+  for (const [name, key] of candidates) {
+    const keyRef = projectRefFromKey(key);
+    if (keyRef && keyRef !== urlRef) mismatches.push({ key: name, urlRef, keyRef });
+  }
+  return mismatches;
+}
+
 function build(): { env: ServerEnv | null; issues: string[] } {
   const parsed = serverSchema.safeParse(process.env);
 
@@ -102,6 +165,18 @@ function build(): { env: ServerEnv | null; issues: string[] } {
 
   if (!supabaseUrl) {
     return { env: null, issues: ["SUPABASE_URL (o NEXT_PUBLIC_SUPABASE_URL) es obligatoria"] };
+  }
+
+  const mismatches = findProjectRefMismatches(process.env);
+  if (mismatches.length > 0) {
+    return {
+      env: null,
+      issues: mismatches.map(
+        (m) =>
+          `${m.key} es del proyecto '${m.keyRef}' pero SUPABASE_URL apunta a '${m.urlRef}'. ` +
+          `Todas las consultas fallarían con 401 "Invalid API key".`
+      ),
+    };
   }
 
   return {
@@ -137,6 +212,19 @@ export function getEnvSafe(): ServerEnv | null {
 export function describeEnvHealth(): { critical: string[]; warnings: string[] } {
   const { env, issues } = build();
   if (!env) return { critical: issues, warnings: [] };
+
+  // Un desajuste de proyecto rompe TODA consulta con 401: es crítico, no un aviso
+  const mismatches = findProjectRefMismatches(process.env);
+  if (mismatches.length > 0) {
+    return {
+      critical: mismatches.map(
+        (m) =>
+          `${m.key} pertenece al proyecto '${m.keyRef}' pero SUPABASE_URL apunta a '${m.urlRef}'. ` +
+          `Copia las claves del proyecto correcto desde Supabase → Settings → API.`
+      ),
+      warnings: [],
+    };
+  }
 
   const warnings: string[] = [];
   if (!env.RESEND_API_KEY) warnings.push("RESEND_API_KEY — necesaria para enviar emails");

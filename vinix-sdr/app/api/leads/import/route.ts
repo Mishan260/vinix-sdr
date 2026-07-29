@@ -12,6 +12,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { randomUUID } from "node:crypto";
 import { parseLeadsCsv } from "@/lib/leads/csv";
 import { EMAIL_REGEX, uuidSchema } from "@/lib/validation/schemas";
+import type { TablesInsert } from "@/lib/supabase/database.types";
 import { loadAccount, remainingLeadQuota } from "@/lib/billing/account";
 import { createUserClient, getUser } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/admin";
@@ -109,7 +110,7 @@ export async function POST(req: NextRequest) {
     const existingCompanies = new Set((existing ?? []).map((l) => String(l.company_name).toLowerCase()));
 
     const warnings: string[] = [];
-    const inserts: Record<string, string | null>[] = [];
+    const inserts: TablesInsert<"leads">[] = [];
     const seen = new Set<string>();
     let skippedDuplicates = 0;
     let skippedSuppressed = 0;

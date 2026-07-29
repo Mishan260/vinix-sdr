@@ -7,11 +7,12 @@
 "use client";
 
 import { createBrowserClient } from "@supabase/ssr";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "./database.types";
+import type { TypedSupabaseClient } from "./types";
 
-let cached: SupabaseClient | null = null;
+let cached: TypedSupabaseClient | null = null;
 
-export function getBrowserClient(): SupabaseClient {
+export function getBrowserClient(): TypedSupabaseClient {
   if (cached) return cached;
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -24,6 +25,6 @@ export function getBrowserClient(): SupabaseClient {
     );
   }
 
-  cached = createBrowserClient(url, key);
+  cached = createBrowserClient<Database>(url, key);
   return cached;
 }

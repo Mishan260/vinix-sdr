@@ -9,11 +9,13 @@
 
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
-import type { SupabaseClient, User } from "@supabase/supabase-js";
+import type { User } from "@supabase/supabase-js";
 import { getEnv } from "@/lib/env";
 import { errors } from "@/lib/errors";
+import type { Database } from "./database.types";
+import type { TypedSupabaseClient } from "./types";
 
-export async function createUserClient(): Promise<SupabaseClient> {
+export async function createUserClient(): Promise<TypedSupabaseClient> {
   const env = getEnv();
   if (!env.supabaseAnonKey) {
     throw errors.config("NEXT_PUBLIC_SUPABASE_ANON_KEY no configurada: sin ella no hay login de usuarios.");
@@ -21,7 +23,7 @@ export async function createUserClient(): Promise<SupabaseClient> {
 
   const cookieStore = await cookies();
 
-  return createServerClient(env.supabaseUrl, env.supabaseAnonKey, {
+  return createServerClient<Database>(env.supabaseUrl, env.supabaseAnonKey, {
     cookies: {
       getAll: () => cookieStore.getAll(),
       setAll: (toSet) => {

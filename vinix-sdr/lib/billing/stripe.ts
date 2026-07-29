@@ -9,7 +9,8 @@
 // ============================================================================
 
 import Stripe from "stripe";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TypedSupabaseClient } from "@/lib/supabase/types";
+import { createServiceClient } from "@/lib/supabase/admin";
 import { errors } from "@/lib/errors";
 import { logger } from "@/lib/logger";
 import { TRIAL_DAYS, planFromPriceId, priceIdFor, type BillingCycle, type PlanId } from "./plans";
@@ -46,7 +47,7 @@ export function isStripeConfigured(): boolean {
  * el usuario a partir del customer sin buscar por email (que puede cambiar).
  */
 export async function ensureCustomer(
-  db: SupabaseClient,
+  db: TypedSupabaseClient,
   params: { userId: string; email: string }
 ): Promise<string> {
   const { data: account, error } = await db
@@ -64,16 +65,30 @@ export async function ensureCustomer(
     metadata: { supabase_user_id: params.userId },
   });
 
-  const { error: updateError } = await db
+  // La escritura va con service role A PROPÓSITO. `accounts` tiene RLS con
+  // política sólo de SELECT: el plan y los identificadores de facturación son
+  // campos de sistema, y dejar que el cliente los escribiera permitiría
+  // auto-otorgarse un plan. El efecto secundario es que un UPDATE con el
+  // cliente del usuario afecta a 0 filas y NO devuelve error, así que el
+  // customer_id no se persistía y cada checkout creaba un cliente nuevo en
+  // Stripe. Por eso aquí se usa el cliente admin y se comprueba el resultado.
+  const { data: updated, error: updateError } = await createServiceClient()
     .from("accounts")
     .update({ stripe_customer_id: customer.id })
-    .eq("user_id", params.userId);
+    .eq("user_id", params.userId)
+    .select("user_id")
+    .maybeSingle();
 
-  if (updateError) {
+  if (updateError || !updated) {
     // El customer ya existe en Stripe pero no se pudo persistir: lo borramos
     // para no dejar clientes huérfanos acumulándose en cada reintento.
     await stripe.customers.del(customer.id).catch(() => {});
-    throw errors.internal(updateError);
+    logger.error("stripe.customer.persist_failed", {
+      userId: params.userId,
+      customerId: customer.id,
+      reason: updateError?.message ?? "la cuenta no existe en la tabla accounts",
+    });
+    throw errors.internal(updateError ?? new Error("No existe la cuenta del usuario"));
   }
 
   logger.info("stripe.customer.created", { userId: params.userId, customerId: customer.id });
@@ -164,7 +179,7 @@ function periodOf(subscription: Stripe.Subscription): { start: number | null; en
  * objeto y el resultado es el mismo.
  */
 export async function syncSubscription(
-  db: SupabaseClient,
+  db: TypedSupabaseClient,
   subscription: Stripe.Subscription
 ): Promise<{ userId: string; plan: PlanId; status: string } | null> {
   const userId =
@@ -221,7 +236,7 @@ export async function syncSubscription(
 }
 
 async function resolveUserFromCustomer(
-  db: SupabaseClient,
+  db: TypedSupabaseClient,
   customer: string | Stripe.Customer | Stripe.DeletedCustomer
 ): Promise<string | null> {
   const customerId = typeof customer === "string" ? customer : customer.id;

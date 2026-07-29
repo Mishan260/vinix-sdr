@@ -29,16 +29,26 @@ function PricingContent() {
   const params = useSearchParams();
   const [cycle, setCycle] = useState<"monthly" | "annual">("annual");
   const [account, setAccount] = useState<AccountInfo | null>(null);
+  const [signedIn, setSignedIn] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<PlanId | "portal" | null>(null);
   const { toasts, notify, dismiss } = useToasts();
 
+  // La página es pública: sin sesión, /api/account responde 401 y simplemente
+  // se muestran los planes con llamadas a registrarse en lugar de a pagar.
   const loadAccount = useCallback(async () => {
     try {
       const res = await fetch("/api/account");
+      if (res.status === 401) {
+        setSignedIn(false);
+        return;
+      }
       if (!res.ok) return;
       const data = await res.json();
-      if (data?.plan) setAccount(data);
+      if (data?.plan) {
+        setAccount(data);
+        setSignedIn(true);
+      }
     } catch {
       /* la página sigue siendo útil sin el estado de la cuenta */
     } finally {
@@ -58,6 +68,14 @@ function PricingContent() {
 
   async function startCheckout(plan: PlanId) {
     if (busy) return;
+
+    // Sin sesión no hay a quién asignarle la suscripción: primero registrarse,
+    // y al volver se retoma el plan elegido.
+    if (!signedIn) {
+      window.location.href = `/signup?plan=${plan}&cycle=${cycle}`;
+      return;
+    }
+
     if (plan === "free") {
       notify("info", "El plan Free se aplica automáticamente al terminar tu suscripción.");
       return;
@@ -110,8 +128,11 @@ function PricingContent() {
     <main className="min-h-screen pb-20">
       <div className="mx-auto max-w-5xl px-4 pt-10 sm:px-6 sm:pt-14">
         <div className="text-center">
-          <Link href="/dashboard" className="text-xs font-medium text-teal-700 hover:underline">
-            ← Volver al panel
+          <Link
+            href={signedIn ? "/dashboard" : "/"}
+            className="text-xs font-medium text-brand-700 hover:underline dark:text-brand-400"
+          >
+            ← {signedIn ? "Volver al panel" : "Volver al inicio"}
           </Link>
           <h1 className="mt-4 text-2xl font-semibold tracking-tight sm:text-3xl">
             Un agente que trabaja tu pipeline cada día
@@ -213,7 +234,7 @@ function PricingContent() {
 
                 <button
                   onClick={() => (isCurrent ? openPortal() : startCheckout(plan.id))}
-                  disabled={busy !== null || loading || (plan.id === "free" && !isCurrent)}
+                  disabled={busy !== null || loading || (signedIn && plan.id === "free" && !isCurrent)}
                   className={`mt-6 inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium shadow-sm transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60 ${
                     isCurrent
                       ? "border border-stone-200 bg-white text-stone-600 hover:bg-stone-50"
@@ -225,11 +246,15 @@ function PricingContent() {
                   {busy === plan.id && <Spinner className="h-4 w-4" />}
                   {isCurrent
                     ? "Gestionar"
-                    : plan.id === "free"
-                      ? "Incluido"
-                      : account?.eligibleForTrial
-                        ? `Probar ${plan.name} gratis`
-                        : `Cambiar a ${plan.name}`}
+                    : !signedIn
+                      ? plan.id === "free"
+                        ? "Empezar gratis"
+                        : `Probar ${plan.name}`
+                      : plan.id === "free"
+                        ? "Incluido"
+                        : account?.eligibleForTrial
+                          ? `Probar ${plan.name} gratis`
+                          : `Cambiar a ${plan.name}`}
                 </button>
               </div>
             );

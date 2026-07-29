@@ -11,9 +11,35 @@
 // ============================================================================
 
 import { z } from "zod";
+import type { LeadStatus } from "@/lib/supabase/database.types";
 
 // ── Primitivas reutilizables ────────────────────────────────────────────────
 export const uuidSchema = z.string().uuid("Identificador inválido");
+
+/**
+ * Estados válidos de un lead. Debe coincidir con el CHECK de la columna
+ * `leads.status`; el tipo `satisfies` lo garantiza en compilación.
+ *
+ * Antes el filtro `?status=` aceptaba cualquier cadena y la pasaba tal cual a
+ * la consulta: un valor inexistente devolvía una lista vacía sin explicar por
+ * qué, en vez de un 422.
+ */
+export const LEAD_STATUSES = [
+  "pending",
+  "researching",
+  "research_failed",
+  "ready_to_send",
+  "sent",
+  "replied",
+  "interested",
+  "not_interested",
+  "out_of_scope",
+  "meeting_booked",
+] as const satisfies readonly LeadStatus[];
+
+export const leadStatusSchema = z.enum(LEAD_STATUSES, {
+  errorMap: () => ({ message: `Estado inválido. Valores admitidos: ${LEAD_STATUSES.join(", ")}` }),
+});
 
 /** Validación de email en un solo sitio: la comparten Zod y el envío directo. */
 export const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -96,7 +122,7 @@ export const updateLeadSchema = z
 
 export const listLeadsQuerySchema = z.object({
   campaignId: uuidSchema.optional(),
-  status: z.string().max(40).optional(),
+  status: leadStatusSchema.optional(),
   limit: z.coerce.number().int().min(1).max(500).optional().default(500),
 });
 

@@ -10,6 +10,7 @@ import { authedRoute } from "@/lib/api/handler";
 import { sendEmailSchema } from "@/lib/validation/schemas";
 import { sendColdEmail } from "@/lib/agent/tools/email";
 import { createServiceClient } from "@/lib/supabase/admin";
+import { toOne } from "@/lib/supabase/relations";
 import { errors } from "@/lib/errors";
 
 export const maxDuration = 30;
@@ -38,11 +39,7 @@ export const POST = authedRoute(
       throw errors.validation("El lead no tiene borrador guardado.");
     }
 
-    const campaign = lead.campaigns as unknown as {
-      sender_name: string;
-      sender_email: string;
-      daily_send_limit: number;
-    } | null;
+    const campaign = toOne(lead.campaigns);
 
     if (!campaign?.sender_email) {
       throw errors.validation("La campaña no tiene remitente configurado.");
@@ -84,6 +81,9 @@ export const POST = authedRoute(
       body: emailBody,
       fromName: campaign.sender_name,
       fromEmail: campaign.sender_email,
+      // Un doble clic o un reintento del navegador no debe enviar dos veces
+      // el mismo email al mismo lead el mismo día.
+      idempotencyKey: `lead:${lead.id}:${new Date().toISOString().slice(0, 10)}`,
     });
 
     if (!result.success) {

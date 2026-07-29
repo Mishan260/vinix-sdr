@@ -37,7 +37,7 @@ export const GET = authedRoute(
 
     if (error) throw fromDbError(error, "los leads");
 
-    const csv = toCsv(COLUMNS, (leads ?? []) as unknown as Record<string, unknown>[]);
+    const csv = toCsv(COLUMNS, leads ?? []);
     const date = new Date().toISOString().slice(0, 10);
     const safeName = String(campaign.name).replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 40);
 

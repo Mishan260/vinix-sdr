@@ -20,6 +20,8 @@ import { classifyReply } from "@/lib/agent/graph";
 import { sendColdEmail } from "@/lib/agent/tools/email";
 import { logger } from "@/lib/logger";
 import { check, RATE_LIMITS } from "@/lib/api/rate-limit";
+import type { LeadStatus, ReplyClassification } from "@/lib/supabase/database.types";
+import { requireOne, toOne } from "@/lib/supabase/relations";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -199,8 +201,8 @@ async function processInbound(
     return { status: "orphaned" };
   }
 
-  const lead = original.leads as unknown as { company_name: string; contact_email: string };
-  const sender = original.campaigns as unknown as { sender_name: string; sender_email: string } | null;
+  const lead = requireOne(original.leads, "leads del email original");
+  const sender = toOne(original.campaigns);
   const slots = getNextTwoBusinessSlots();
 
   // ── Clasificación ────────────────────────────────────────────────────────
@@ -248,7 +250,9 @@ async function processInbound(
 
   if (insertError) throw insertError;
 
-  const STATUS_BY_CLASSIFICATION: Record<string, string> = {
+  // La clasificación de la IA se traduce al estado del lead. Tipado contra el
+  // enum real: añadir una categoría nueva sin mapearla no compila.
+  const STATUS_BY_CLASSIFICATION: Record<ReplyClassification, LeadStatus> = {
     interested: "interested",
     not_interested: "not_interested",
     out_of_scope: "out_of_scope",
@@ -261,12 +265,27 @@ async function processInbound(
     .eq("id", original.lead_id);
 
   // ── Auto-respuesta: sólo con interés claro y alta confianza ──────────────
+  // `contact_email` es nullable: un lead importado sin email puede responder
+  // igualmente desde otra dirección. Sin esta comprobación se llamaba al
+  // proveedor con destinatario null y el fallo aparecía como error de envío
+  // en vez de como lo que es: no sabemos a dónde responder.
   const CONFIDENCE_THRESHOLD = 0.75;
-  if (
+  const canAutoReply =
     classification.classification === "interested" &&
     classification.confidence >= CONFIDENCE_THRESHOLD &&
-    classification.suggested_response
-  ) {
+    Boolean(classification.suggested_response);
+
+  if (canAutoReply && !lead.contact_email) {
+    log.warn("webhook.inbound.autoreply_skipped_no_email", { leadId: original.lead_id });
+    await db
+      .from("replies")
+      .update({
+        flagged_for_review: true,
+        review_reason: "ai_classification_failed",
+        send_error: "El lead no tiene email de contacto: la respuesta queda para envío manual",
+      })
+      .eq("id", replyRow.id);
+  } else if (canAutoReply && lead.contact_email && classification.suggested_response) {
     const sendResult = await sendColdEmail({
       to: lead.contact_email,
       subject: inbound.subject.startsWith("Re: ") ? inbound.subject : `Re: ${inbound.subject}`,

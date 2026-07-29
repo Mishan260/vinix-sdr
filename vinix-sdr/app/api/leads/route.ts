@@ -8,6 +8,7 @@
 import { z } from "zod";
 import { authedRoute, fromDbError } from "@/lib/api/handler";
 import { listLeadsQuerySchema, updateLeadSchema, uuidSchema } from "@/lib/validation/schemas";
+import type { TablesUpdate } from "@/lib/supabase/database.types";
 import { errors } from "@/lib/errors";
 
 export const dynamic = "force-dynamic";
@@ -42,10 +43,12 @@ export const PATCH = authedRoute(
   async ({ body, query, db }) => {
     const { resetForResearch, ...fields } = body;
 
-    const patch: Record<string, unknown> = {};
+    // Tipado contra el esquema real: un nombre de columna equivocado aquí es
+    // ahora un error de compilación, no un PGRST204 en producción.
+    const patch: TablesUpdate<"leads"> = {};
     for (const [key, value] of Object.entries(fields)) {
       // Cadena vacía → NULL: el usuario está limpiando el campo, no guardando ""
-      patch[key] = value === "" ? null : value;
+      (patch as Record<string, unknown>)[key] = value === "" ? null : value;
     }
 
     if (resetForResearch) {

@@ -8,7 +8,7 @@
 // Por eso recibe el cliente y el ámbito como parámetros, en vez de decidirlos.
 // ============================================================================
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TypedSupabaseClient } from "@/lib/supabase/types";
 import { completeJSON } from "./llm";
 import { FOLLOW_UP_PROMPT } from "./prompts";
 import { sendColdEmail } from "./tools/email";
@@ -34,7 +34,7 @@ interface CampaignRow {
 }
 
 /** Cuántos follow-ups están listos para enviarse en una campaña. */
-export async function countDueFollowUps(db: SupabaseClient, campaignId: string): Promise<number> {
+export async function countDueFollowUps(db: TypedSupabaseClient, campaignId: string): Promise<number> {
   const { data: campaign } = await db
     .from("campaigns")
     .select("followups_enabled, followup_delay_days, followup_max_touches")
@@ -57,7 +57,7 @@ export async function countDueFollowUps(db: SupabaseClient, campaignId: string):
 }
 
 export async function runFollowUps(
-  db: SupabaseClient,
+  db: TypedSupabaseClient,
   options: { campaignIds?: string[]; userId?: string } = {}
 ): Promise<FollowUpReport> {
   const log = logger.child({ event: "agent.followups", userId: options.userId });
@@ -174,6 +174,9 @@ export async function runFollowUps(
         body: followUp.body,
         fromName: campaign.sender_name,
         fromEmail: campaign.sender_email,
+        // El cron puede solaparse con un envío manual: la clave incluye el
+        // número de toque para que el mismo follow-up no salga dos veces.
+        idempotencyKey: `followup:${lead.id}:${lead.follow_ups_sent + 1}`,
       });
 
       if (!sendResult.success) {

@@ -30,6 +30,18 @@ import {
 } from "@/components/ui";
 import { UserMenu } from "@/components/user-menu";
 import { useToasts } from "@/lib/hooks/use-toasts";
+import { useRouter } from "next/navigation";
+import { useLiveCampaignData } from "@/lib/hooks/use-live-campaign-data";
+import { useOnboarding } from "@/lib/hooks/use-onboarding";
+import { mapWithPool } from "@/lib/queue/retry";
+import { OnboardingChecklist } from "@/components/onboarding/checklist";
+import {
+  ContextualTip,
+  DemoCampaignBanner,
+  NoLeadsForFilter,
+  NoLeadsYet,
+  NoRepliesYet,
+} from "@/components/onboarding/empty-states";
 
 // ── Tipos ───────────────────────────────────────────────────────────────────
 interface Lead {
@@ -50,6 +62,8 @@ interface Lead {
 interface Campaign {
   id: string;
   name: string;
+  /** Campaña de ejemplo: se señala en la interfaz y nunca envía emails. */
+  is_demo?: boolean;
 }
 
 interface Reply {
@@ -109,6 +123,16 @@ const REVIEW_REASON_LABEL: Record<string, string> = {
 };
 
 const CAMPAIGN_STORAGE_KEY = "vinix.selectedCampaign";
+
+/**
+ * Investigaciones simultáneas en un lote.
+ * Cada una consume scraping + 2 llamadas al LLM; 4 en paralelo acorta el lote
+ * sin acercarse a los límites de velocidad de OpenAI ni de Firecrawl.
+ */
+const RESEARCH_CONCURRENCY = 4;
+
+/** Cada cuántos leads terminados se refresca el pipeline en pantalla. */
+const RESEARCH_REFRESH_EVERY = 5;
 
 // ============================================================================
 // Fila de lead memoizada: solo re-renderiza si cambian sus props.
@@ -201,18 +225,20 @@ const IconMailSmall = () => (
 // COMPONENTE PRINCIPAL
 // ============================================================================
 export default function Dashboard() {
+  const router = useRouter();
+  const onboarding = useOnboarding();
+
   // ── Datos ─────────────────────────────────────────────────────────────────
   const [health, setHealth] = useState<Health | null>(null);
   const [account, setAccount] = useState<AccountInfo | null>(null);
-  const [followUpsDue, setFollowUpsDue] = useState(0);
   const [sendingFollowUps, setSendingFollowUps] = useState(false);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [campaignId, setCampaignId] = useState<string>("");
-  const [leads, setLeads] = useState<Lead[]>([]);
-  const [replies, setReplies] = useState<Reply[]>([]);
   const [booting, setBooting] = useState(true);
-  const [firstDataLoad, setFirstDataLoad] = useState(true);
   const [statusFilter, setStatusFilter] = useState<string>("all");
+  // Eliminación optimista: la fila desaparece al instante y se reconcilia con
+  // el siguiente evento de Realtime.
+  const [deletedIds, setDeletedIds] = useState<Set<string>>(new Set());
 
   // ── Acciones en curso (guards anti doble-submit) ─────────────────────────
   const [busyLead, setBusyLead] = useState<string | null>(null);
@@ -249,27 +275,22 @@ export default function Dashboard() {
   // ── Toasts ────────────────────────────────────────────────────────────────
   const { toasts, notify, dismiss: dismissToast } = useToasts();
 
-  // ── Guard de respuestas obsoletas: solo la última petición puede escribir ─
-  const fetchSeq = useRef(0);
+  // ── Datos en vivo, dirigidos por eventos de Postgres ─────────────────────
+  // Sustituye al setInterval de 15 s que generaba 720 peticiones/hora por
+  // usuario devolviendo casi siempre lo mismo. Ahora sólo se recarga cuando
+  // algo cambia de verdad. Se pausa con modales o lotes abiertos, igual que antes.
+  const livePaused = Boolean(openDraft || showNewCampaign || confirmDelete || editLead || batch);
 
-  const loadLiveData = useCallback(async () => {
-    if (!campaignId) return;
-    const seq = ++fetchSeq.current;
-    try {
-      const [l, r, fu] = await Promise.all([
-        fetch(`/api/leads?campaignId=${campaignId}`).then((res) => res.json()),
-        fetch(`/api/replies?campaignId=${campaignId}`).then((res) => res.json()),
-        fetch(`/api/agent/followups?campaignId=${campaignId}`).then((res) => res.json()).catch(() => ({ due: 0 })),
-      ]);
-      if (seq !== fetchSeq.current) return; // llegó tarde: hay datos más nuevos
-      if (l?.leads) setLeads(l.leads);
-      if (r?.replies) setReplies(r.replies);
-      setFollowUpsDue(fu?.due ?? 0);
-      setFirstDataLoad(false);
-    } catch {
-      /* red caída puntual: el siguiente ciclo lo reintenta */
-    }
-  }, [campaignId]);
+  const {
+    leads,
+    replies,
+    followUpsDue,
+    loading: liveLoading,
+    refresh: loadLiveData,
+  } = useLiveCampaignData<Lead, Reply>({ campaignId, paused: livePaused });
+
+  // El esqueleto se muestra mientras no hay datos de esta campaña
+  const firstDataLoad = liveLoading;
 
   // ── Arranque: salud → campañas → restaurar selección ─────────────────────
   useEffect(() => {
@@ -290,6 +311,18 @@ export default function Dashboard() {
         setCampaigns(list);
 
         if (list.length === 0) {
+          // Sin campañas, el recorrido guiado es mejor punto de entrada que un
+          // formulario de cuatro campos: allí se crea la campaña como efecto
+          // secundario de ver el producto funcionar, no como requisito previo.
+          const onboarding = await fetch("/api/onboarding")
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null);
+
+          if (onboarding?.shouldRedirect) {
+            router.replace("/bienvenida");
+            return;
+          }
+          // Quien ya descartó el recorrido sí ve el formulario clásico
           setShowNewCampaign(true);
         } else {
           // Restaurar la campaña seleccionada tras recarga (si sigue existiendo)
@@ -301,17 +334,17 @@ export default function Dashboard() {
       }
       setBooting(false);
     })();
-  }, []);
+  }, [router]);
 
-  // ── Al cambiar de campaña: persistir + cargar datos + cargar plantilla ────
+  // ── Al cambiar de campaña: persistir selección + cargar plantilla ─────────
+  // Los leads y respuestas los carga useLiveCampaignData por su cuenta.
   useEffect(() => {
     if (!campaignId) return;
     localStorage.setItem(CAMPAIGN_STORAGE_KEY, campaignId);
-    setFirstDataLoad(true);
     setStatusFilter("all");
-    loadLiveData();
+    setDeletedIds(new Set());
 
-    // La plantilla se carga UNA vez por campaña, nunca en el polling.
+    // La plantilla se carga UNA vez por campaña, nunca en cada refresco.
     // Si hay cambios sin guardar (cambio rápido de campaña), no se pisan.
     (async () => {
       const t = await fetch(`/api/templates?campaignId=${campaignId}`).then((r) => r.json()).catch(() => null);
@@ -327,18 +360,7 @@ export default function Dashboard() {
         setTemplateSave("idle");
       }
     })();
-  }, [campaignId, loadLiveData]);
-
-  // ── Polling inteligente: pausado si pestaña oculta, modal abierto o lote ──
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (document.hidden) return;
-      if (openDraft || showNewCampaign || confirmDelete || editLead) return;
-      if (batch) return; // el lote ya refresca por su cuenta
-      loadLiveData();
-    }, 15_000);
-    return () => clearInterval(interval);
-  }, [loadLiveData, openDraft, showNewCampaign, confirmDelete, editLead, batch]);
+  }, [campaignId]);
 
   // ── beforeunload: no perder cambios ni lotes por accidente ───────────────
   useEffect(() => {
@@ -433,26 +455,46 @@ export default function Dashboard() {
   }, [runResearch, notify, loadLiveData]);
 
   async function researchAllPending() {
-    const pending = leads.filter((l) => l.status === "pending");
+    const pending = visibleLeads.filter((l) => l.status === "pending");
     if (pending.length === 0 || batch) return;
+
     batchCancelled.current = false;
     setBatch({ done: 0, total: pending.length });
+
     let okCount = 0;
+    let done = 0;
+
     try {
-      for (let i = 0; i < pending.length; i++) {
-        if (batchCancelled.current) break;
-        if (await runResearch(pending[i].id)) okCount++;
-        setBatch({ done: i + 1, total: pending.length });
-        if ((i + 1) % 5 === 0) loadLiveData();
-      }
+      // En serie, cada lead esperaba a que terminara el anterior: scraping +
+      // dos llamadas al LLM son ~10 s, así que 50 leads tardaban unos 8 minutos.
+      // Con concurrencia limitada el tiempo baja en proporción, sin disparar
+      // los límites de velocidad de OpenAI y Firecrawl.
+      const outcomes = await mapWithPool(
+        pending,
+        async (lead) => {
+          const ok = await runResearch(lead.id);
+          done++;
+          setBatch({ done, total: pending.length });
+          // Refresco periódico para que el pipeline se vea avanzar
+          if (done % RESEARCH_REFRESH_EVERY === 0) void loadLiveData();
+          return ok;
+        },
+        {
+          concurrency: RESEARCH_CONCURRENCY,
+          shouldStop: () => batchCancelled.current,
+        }
+      );
+
+      okCount = outcomes.filter((o) => o.value === true).length;
     } finally {
       // El finally garantiza que el lote nunca queda "colgado" en pantalla
-      // (batch activo pausa el polling: sin esto, un error congelaba el panel)
+      // (batch activo pausa las recargas: sin esto, un error congelaba el panel)
       setBatch(null);
     }
+
     const processed = batchCancelled.current ? "Lote cancelado" : "Lote terminado";
     notify(okCount > 0 ? "success" : "info", `${processed}: ${okCount} borradores listos`);
-    loadLiveData();
+    void loadLiveData();
   }
 
   const openDraftModal = useCallback((lead: Lead) => {
@@ -520,6 +562,56 @@ export default function Dashboard() {
     }
   }
 
+  // ── Onboarding: acciones que ocurren dentro del panel ────────────────────
+  const importInputRef = useRef<HTMLInputElement>(null);
+
+  /** La campaña activa es de ejemplo: se avisa para que nadie la confunda. */
+  const activeCampaignIsDemo = campaigns.find((c) => c.id === campaignId)?.is_demo ?? false;
+
+  /** Traduce la acción de una tarea de la lista en algo que ocurre en pantalla. */
+  function handleOnboardingIntent(intent: string) {
+    if (intent === "open-import") {
+      importInputRef.current?.click();
+      return;
+    }
+    if (intent === "filter-drafts") {
+      setStatusFilter("ready_to_send");
+      return;
+    }
+    if (intent === "open-sender") {
+      // La configuración del remitente vive en la sección de plantilla
+      document.getElementById("configuracion-campana")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      notify("info", "Configura aquí el remitente de esta campaña.");
+    }
+  }
+
+  async function createDemoCampaign() {
+    const campaignId = await onboarding.createDemo();
+    if (!campaignId) {
+      notify("error", "No se pudo crear la campaña de ejemplo. Inténtalo de nuevo en un momento.");
+      return;
+    }
+
+    const list = await fetch("/api/campaigns").then((r) => r.json()).catch(() => null);
+    if (list?.campaigns) setCampaigns(list.campaigns);
+    setCampaignId(campaignId);
+    notify("success", "Campaña de ejemplo creada. Sus leads son ficticios y no se enviará nada.");
+  }
+
+  async function removeDemoCampaign() {
+    const ok = await onboarding.removeDemo();
+    if (!ok) {
+      notify("error", "No se pudo eliminar la campaña de ejemplo. Inténtalo de nuevo.");
+      return;
+    }
+
+    const list = await fetch("/api/campaigns").then((r) => r.json()).catch(() => null);
+    const remaining: Campaign[] = list?.campaigns ?? [];
+    setCampaigns(remaining);
+    setCampaignId(remaining[0]?.id ?? "");
+    notify("success", "Campaña de ejemplo eliminada.");
+  }
+
   const requestDelete = useCallback((lead: Lead) => setConfirmDelete(lead), []);
 
   const openEditLead = useCallback((lead: Lead) => {
@@ -576,18 +668,30 @@ export default function Dashboard() {
     if (!confirmDelete) return;
     const lead = confirmDelete;
     setConfirmDelete(null);
-    // Optimista: desaparece al instante; si falla, se restaura con el reload
-    setLeads((ls) => ls.filter((l) => l.id !== lead.id));
+
+    // Optimista: la fila desaparece al instante. Si el borrado falla, se quita
+    // de la lista local y la recarga la devuelve a su sitio.
+    setDeletedIds((ids) => new Set(ids).add(lead.id));
+
+    const revert = () => {
+      setDeletedIds((ids) => {
+        const next = new Set(ids);
+        next.delete(lead.id);
+        return next;
+      });
+      void loadLiveData();
+    };
+
     try {
       const res = await fetch(`/api/leads?id=${lead.id}`, { method: "DELETE" });
       if (res.ok) notify("success", `"${lead.company_name}" eliminado`);
       else {
         notify("error", "No se pudo eliminar el lead");
-        loadLiveData();
+        revert();
       }
     } catch {
       notify("error", "No se pudo eliminar el lead: fallo de red");
-      loadLiveData();
+      revert();
     }
   }
 
@@ -645,28 +749,40 @@ export default function Dashboard() {
   }
 
   // ── Derivados ─────────────────────────────────────────────────────────────
+  // Los leads borrados de forma optimista se filtran aquí, una sola vez, para
+  // que todo lo que se calcula debajo sea coherente con lo que se ve.
+  const visibleLeads = useMemo(
+    () => (deletedIds.size === 0 ? leads : leads.filter((l) => !deletedIds.has(l.id))),
+    [leads, deletedIds]
+  );
+
   const filteredLeads = useMemo(
-    () => (statusFilter === "all" ? leads : leads.filter((l) => l.status === statusFilter)),
-    [leads, statusFilter]
+    () => (statusFilter === "all" ? visibleLeads : visibleLeads.filter((l) => l.status === statusFilter)),
+    [visibleLeads, statusFilter]
   );
 
   const statusCounts = useMemo(() => {
     const counts: Record<string, number> = {};
-    for (const l of leads) counts[l.status] = (counts[l.status] ?? 0) + 1;
+    for (const l of visibleLeads) counts[l.status] = (counts[l.status] ?? 0) + 1;
     return counts;
-  }, [leads]);
+  }, [visibleLeads]);
 
+  // El embudo se deriva de statusCounts en vez de recorrer `leads` otras dos
+  // veces: con 500 leads eran 1.000 comparaciones extra en cada render.
   const funnel = useMemo(() => {
-    const sent = leads.filter((l) => !["pending", "researching", "research_failed", "ready_to_send"].includes(l.status)).length;
-    const replied = leads.filter((l) => ["replied", "interested", "not_interested", "out_of_scope", "meeting_booked"].includes(l.status)).length;
+    const countOf = (...statuses: string[]) => statuses.reduce((n, s) => n + (statusCounts[s] ?? 0), 0);
+
+    const sent = countOf("sent", "replied", "interested", "not_interested", "out_of_scope", "meeting_booked");
+    const replied = countOf("replied", "interested", "not_interested", "out_of_scope", "meeting_booked");
+
     return {
-      total: leads.length,
+      total: visibleLeads.length,
       sent,
       responseRate: sent > 0 ? Math.round((replied / sent) * 100) : null,
       interested: (statusCounts.interested ?? 0) + (statusCounts.meeting_booked ?? 0),
       booked: statusCounts.meeting_booked ?? 0,
     };
-  }, [leads, statusCounts]);
+  }, [visibleLeads.length, statusCounts]);
 
   const planLabel = !account
     ? "Cargando plan…"
@@ -678,8 +794,13 @@ export default function Dashboard() {
 
   const pendingCount = statusCounts.pending ?? 0;
   const draftWordCount = editBody.trim() ? editBody.trim().split(/\s+/).length : 0;
-  const flaggedReplies = useMemo(() => replies.filter((r) => r.flagged_for_review), [replies]);
-  const normalReplies = useMemo(() => replies.filter((r) => !r.flagged_for_review), [replies]);
+  // Una sola pasada en vez de dos filtros independientes sobre el mismo array
+  const { flaggedReplies, normalReplies } = useMemo(() => {
+    const flagged: Reply[] = [];
+    const normal: Reply[] = [];
+    for (const r of replies) (r.flagged_for_review ? flagged : normal).push(r);
+    return { flaggedReplies: flagged, normalReplies: normal };
+  }, [replies]);
 
   // ══════════════════════════════════════════════════════════════════════════
   // RENDER
@@ -790,6 +911,7 @@ export default function Dashboard() {
                 {importing ? <Spinner className="h-4 w-4" /> : <IconUpload />}
                 {importing ? "Importando…" : "Importar CSV"}
                 <input
+                  ref={importInputRef}
                   type="file" accept=".csv" className="hidden" disabled={importing}
                   onChange={(e) => { if (e.target.files?.[0]) importCSV(e.target.files[0]); e.target.value = ""; }}
                 />
@@ -801,6 +923,25 @@ export default function Dashboard() {
       </header>
 
       <div className="mx-auto max-w-6xl px-6">
+        {/* ── Onboarding: lista de tareas mientras quede algo pendiente ────── */}
+        {onboarding.showChecklist && (
+          <div className="mt-5">
+            <OnboardingChecklist
+              tasks={onboarding.tasks}
+              progress={onboarding.progress}
+              onDismiss={onboarding.dismissChecklist}
+              onIntent={handleOnboardingIntent}
+            />
+          </div>
+        )}
+
+        {/* Aviso de campaña de ejemplo: nunca debe confundirse con datos reales */}
+        {activeCampaignIsDemo && (
+          <div className="mt-5">
+            <DemoCampaignBanner onRemove={removeDemoCampaign} removing={onboarding.demoBusy} />
+          </div>
+        )}
+
         {/* Avisos de configuración opcionales */}
         {health && health.warnings.length > 0 && (
           <div className="animate-fade-in mt-5 rounded-xl border border-stone-200 bg-white px-4 py-3 text-xs leading-relaxed text-stone-500">
@@ -909,6 +1050,16 @@ export default function Dashboard() {
           </section>
         )}
 
+        {/* Consejo contextual: sólo cuando el usuario acaba de encontrarse con
+            un lead sin gancho, que es cuando la explicación tiene sentido. */}
+        {!booting &&
+          (statusCounts.research_failed ?? 0) > 0 &&
+          !onboarding.isTipDismissed("research_failed") && (
+            <div className="mt-6">
+              <ContextualTip id="research_failed" onDismiss={onboarding.dismissTip} />
+            </div>
+          )}
+
         {/* ── Lote en curso ────────────────────────────────────────────────── */}
         <section className="mt-6 flex items-center justify-between">
           <h2 className="text-sm font-semibold tracking-tight text-stone-800">Pipeline</h2>
@@ -957,16 +1108,18 @@ export default function Dashboard() {
                 ))}
               {!booting && !firstDataLoad && filteredLeads.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-5 py-14 text-center">
-                    {leads.length === 0 ? (
-                      <div className="mx-auto max-w-sm">
-                        <p className="text-sm font-medium text-stone-700">Empieza importando leads</p>
-                        <p className="mt-1.5 text-xs leading-relaxed text-stone-400">
-                          Sube un CSV con las columnas <code className="rounded bg-stone-100 px-1">company_name</code>, <code className="rounded bg-stone-100 px-1">company_url</code>, <code className="rounded bg-stone-100 px-1">contact_name</code> y <code className="rounded bg-stone-100 px-1">contact_email</code>. Acepta separador coma o punto y coma.
-                        </p>
-                      </div>
+                  <td colSpan={5} className="p-0">
+                    {visibleLeads.length === 0 ? (
+                      <NoLeadsYet
+                        onImport={() => importInputRef.current?.click()}
+                        onCreateDemo={createDemoCampaign}
+                        creatingDemo={onboarding.demoBusy}
+                      />
                     ) : (
-                      <p className="text-sm text-stone-400">Ningún lead con ese estado. <button onClick={() => setStatusFilter("all")} className="text-teal-700 hover:underline">Quitar filtro</button></p>
+                      <NoLeadsForFilter
+                        statusLabel={STATUS_META[statusFilter]?.label ?? statusFilter}
+                        onClear={() => setStatusFilter("all")}
+                      />
                     )}
                   </td>
                 </tr>
@@ -988,6 +1141,13 @@ export default function Dashboard() {
         </section>
 
         {/* ── Respuestas ───────────────────────────────────────────────────── */}
+        {!booting && !firstDataLoad && flaggedReplies.length === 0 && normalReplies.length === 0 && visibleLeads.length > 0 && (
+          <section className="mt-10">
+            <h2 className="mb-3 text-sm font-semibold tracking-tight text-stone-800">Respuestas recibidas</h2>
+            <NoRepliesYet hasSent={funnel.sent > 0} />
+          </section>
+        )}
+
         {(flaggedReplies.length > 0 || normalReplies.length > 0) && (
           <section className="mt-10">
             <h2 className="mb-3 text-sm font-semibold tracking-tight text-stone-800">Respuestas recibidas</h2>
@@ -1047,7 +1207,7 @@ export default function Dashboard() {
 
         {/* ── Plantilla (guardado fiable, aislado del polling) ─────────────── */}
         {campaignId && !booting && (
-          <section className="mt-10 rounded-2xl border border-stone-200 bg-white p-6 shadow-sm">
+          <section id="configuracion-campana" className="mt-10 scroll-mt-20 rounded-2xl border border-stone-200 bg-white p-6 shadow-sm">
             <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-sm font-semibold tracking-tight text-stone-800">Plantilla de la campaña</h2>
               {templateDirty && (

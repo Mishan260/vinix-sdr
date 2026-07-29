@@ -16,7 +16,10 @@ export const dynamic = "force-dynamic";
 export const GET = authedRoute({ event: "campaigns.list", rateLimit: "read" }, async ({ db }) => {
   const { data, error } = await db
     .from("campaigns")
-    .select("id, name, value_proposition, sender_name, sender_email, status, created_at")
+    .select("id, name, value_proposition, sender_name, sender_email, status, is_demo, created_at")
+    // Las campañas reales primero: la de ejemplo no debe quedar seleccionada
+    // por defecto cuando el usuario ya tiene datos propios.
+    .order("is_demo", { ascending: true })
     .order("created_at", { ascending: false });
 
   if (error) throw fromDbError(error, "las campañas");
@@ -27,7 +30,17 @@ export const POST = authedRoute(
   { event: "campaigns.create", body: createCampaignSchema, rateLimit: "mutation" },
   async ({ body, db, user, log }) => {
     const state = await loadAccount(db, user.id);
-    console.log("ACCOUNT STATE:", JSON.stringify(state, null, 2));
+
+    // Traza estructurada del uso frente al límite. Sustituye al console.log de
+    // depuración: va al logger (redacta secretos, lleva requestId y userId) en
+    // vez de volcar el objeto entero a los logs de Vercel en texto plano.
+    log.debug("campaigns.quota_check", {
+      plan: state.effective.planId,
+      isTrial: state.effective.isTrial,
+      used: state.usage.campaigns,
+      limit: state.effective.limits.campaigns === Infinity ? "ilimitado" : state.effective.limits.campaigns,
+    });
+
     assertCanCreateCampaign(state);
 
     const { data, error } = await db
