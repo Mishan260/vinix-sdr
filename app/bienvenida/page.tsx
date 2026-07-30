@@ -1,0 +1,683 @@
+"use client";
+
+// ============================================================================
+// Recorrido guiado inicial.
+//
+// Cuatro pantallas, dos campos, un resultado real. El objetivo no es enseñar
+// la aplicación: es que el usuario vea a Vinix leer una empresa de verdad y
+// escribir un email que merezca su firma.
+//
+// PERSISTENCIA: el paso activo se deriva del estado del servidor, no de la URL
+// ni de un estado local. Quien cierra la pestaña a mitad y vuelve mañana
+// aterriza exactamente donde lo dejó.
+// ============================================================================
+
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Button, ButtonLink, Logo } from "@/components/brand";
+import { Spinner, ToastStack } from "@/components/ui";
+import { useToasts } from "@/lib/hooks/use-toasts";
+import { GUIDED_STEPS, SUGGESTED_COMPANIES, type GuidedStep } from "@/lib/onboarding/steps";
+
+interface TryResult {
+  outcome: "drafted" | "no_hook";
+  campaignId: string;
+  leadId: string;
+  companyName: string;
+  reason?: string;
+  research?: {
+    sector: string | null;
+    size: string | null;
+    painPoint: string | null;
+    decisionMaker: string | null;
+  };
+  draft?: { subject: string; body: string; wordCount: number };
+}
+
+function GuideContent() {
+  const router = useRouter();
+  const params = useSearchParams();
+  const { toasts, dismiss } = useToasts();
+
+  const [step, setStep] = useState<GuidedStep>("welcome");
+  const [loadingState, setLoadingState] = useState(true);
+
+  const [offer, setOffer] = useState("");
+  const [offerError, setOfferError] = useState<string | null>(null);
+  const [savingOffer, setSavingOffer] = useState(false);
+
+  const [companyUrl, setCompanyUrl] = useState("");
+  const [companyError, setCompanyError] = useState<string | null>(null);
+  const [researching, setResearching] = useState(false);
+  const [result, setResult] = useState<TryResult | null>(null);
+
+  // Instante en que arrancó el recorrido: permite medir cuánto tarda cada paso
+  const startedAt = useRef(new Date().toISOString());
+
+  const post = useCallback(async (payload: Record<string, unknown>) => {
+    const res = await fetch("/api/onboarding", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return res.ok ? res.json() : null;
+  }, []);
+
+  // ── Estado inicial: retomar donde se dejó ─────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch("/api/onboarding");
+        if (!res.ok) {
+          // Sin onboarding disponible el producto sigue siendo usable: se
+          // envía al panel en lugar de bloquear con un error.
+          router.replace("/dashboard");
+          return;
+        }
+        const data = await res.json();
+
+        if (data.snapshot?.valueProposition) setOffer(data.snapshot.valueProposition);
+
+        // El parámetro de la URL sólo puede adelantar a un paso ya alcanzable
+        const requested = params.get("paso") as GuidedStep | null;
+        const allowed = GUIDED_STEPS.indexOf(data.resumeAt as GuidedStep);
+        const wanted = requested ? GUIDED_STEPS.indexOf(requested) : -1;
+        setStep(wanted >= 0 && wanted <= allowed ? (requested as GuidedStep) : (data.resumeAt as GuidedStep));
+      } catch {
+        router.replace("/dashboard");
+      } finally {
+        setLoadingState(false);
+      }
+    })();
+  }, [params, router]);
+
+  // ── Paso 1 → 2 ────────────────────────────────────────────────────────────
+  async function startGuide() {
+    setStep("offer");
+    void post({ markWelcomed: true, event: "welcome_viewed", startedAt: startedAt.current });
+  }
+
+  // ── Paso 2: qué vendes ────────────────────────────────────────────────────
+  async function submitOffer() {
+    const value = offer.trim();
+
+    if (value.length < 15) {
+      setOfferError(
+        "Necesitamos un poco más de detalle. Describe qué vendes y con qué resultado concreto: es lo que el agente usará para conectar tu oferta con el dolor de cada empresa."
+      );
+      return;
+    }
+
+    setOfferError(null);
+    setSavingOffer(true);
+    try {
+      const data = await post({
+        valueProposition: value,
+        event: "offer_submitted",
+        startedAt: startedAt.current,
+      });
+      if (!data) {
+        setOfferError("No se pudo guardar. Comprueba tu conexión e inténtalo de nuevo.");
+        return;
+      }
+      setStep("company");
+    } finally {
+      setSavingOffer(false);
+    }
+  }
+
+  // ── Paso 3: investigar una empresa ────────────────────────────────────────
+  async function runResearch(url: string) {
+    const target = url.trim();
+    if (!target) {
+      setCompanyError("Escribe la web de una empresa, por ejemplo: stripe.com");
+      return;
+    }
+
+    setCompanyError(null);
+    setResearching(true);
+    try {
+      const res = await fetch("/api/onboarding/try", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ companyUrl: target, startedAt: startedAt.current }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setCompanyError(
+          data?.error ??
+            "No se pudo completar la investigación. Prueba con otra empresa o inténtalo de nuevo en un momento."
+        );
+        return;
+      }
+
+      setResult(data as TryResult);
+      setStep("result");
+      void post({ event: "draft_viewed", startedAt: startedAt.current });
+    } catch {
+      setCompanyError(
+        "No hemos podido conectar con el servidor. Comprueba tu conexión e inténtalo de nuevo; no se ha perdido nada de lo que llevas hecho."
+      );
+    } finally {
+      setResearching(false);
+    }
+  }
+
+  // ── Cierre ────────────────────────────────────────────────────────────────
+  async function finish() {
+    await post({ complete: true, event: "onboarding_completed", startedAt: startedAt.current });
+    router.push("/dashboard");
+  }
+
+  async function skip() {
+    await post({ dismiss: true, event: "onboarding_dismissed", startedAt: startedAt.current });
+    router.push("/dashboard");
+  }
+
+  if (loadingState) {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <Spinner className="h-6 w-6 text-ink-subtle" />
+        <span className="sr-only">Cargando tu progreso</span>
+      </div>
+    );
+  }
+
+  const stepIndex = GUIDED_STEPS.indexOf(step);
+
+  return (
+    <div className="flex min-h-screen flex-col">
+      {/* Cabecera con progreso */}
+      <header className="border-b border-line">
+        <div className="mx-auto flex w-full max-w-3xl items-center gap-4 px-5 py-4 sm:px-8">
+          <Logo className="h-7 w-7" />
+
+          <ol className="ml-2 flex flex-1 items-center gap-2" aria-label="Progreso del recorrido">
+            {GUIDED_STEPS.map((s, i) => (
+              <li key={s} className="flex flex-1 items-center gap-2">
+                <span
+                  aria-current={i === stepIndex ? "step" : undefined}
+                  className={`h-1 flex-1 rounded-full transition-colors duration-500 ${
+                    i <= stepIndex ? "bg-brand-500" : "bg-line"
+                  }`}
+                />
+              </li>
+            ))}
+          </ol>
+
+          <span className="text-xs tabular-nums text-ink-subtle" aria-live="polite">
+            {stepIndex + 1} de {GUIDED_STEPS.length}
+          </span>
+        </div>
+      </header>
+
+      <main className="flex flex-1 items-center justify-center px-5 py-10 sm:px-8">
+        <div className="w-full max-w-2xl">
+          {step === "welcome" && <WelcomeStep onStart={startGuide} onSkip={skip} />}
+
+          {step === "offer" && (
+            <OfferStep
+              value={offer}
+              onChange={setOffer}
+              error={offerError}
+              pending={savingOffer}
+              onSubmit={submitOffer}
+              onSkip={skip}
+            />
+          )}
+
+          {step === "company" && (
+            <CompanyStep
+              value={companyUrl}
+              onChange={setCompanyUrl}
+              error={companyError}
+              pending={researching}
+              onSubmit={() => runResearch(companyUrl)}
+              onPick={(url) => {
+                setCompanyUrl(url);
+                void runResearch(url);
+              }}
+              onSkip={skip}
+            />
+          )}
+
+          {step === "result" && result && <ResultStep result={result} onFinish={finish} />}
+
+          {step === "result" && !result && (
+            <ResumedStep onFinish={finish} onRetry={() => setStep("company")} />
+          )}
+        </div>
+      </main>
+
+      <ToastStack toasts={toasts} onDismiss={dismiss} />
+
+      {/* Anuncio para lectores de pantalla: la espera larga debe ser audible */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {researching ? "Investigando la empresa. Esto tarda entre 10 y 30 segundos." : ""}
+      </span>
+    </div>
+  );
+}
+
+// ── Paso 1: bienvenida ──────────────────────────────────────────────────────
+function WelcomeStep({ onStart, onSkip }: { onStart: () => void; onSkip: () => void }) {
+  return (
+    <div className="animate-rise-in text-center">
+      <h1 className="text-display text-balance">
+        <span className="text-ink">No vas a enviar más emails.</span>
+        <br />
+        <span className="text-gradient">Vas a enviar muchos menos, y mejores.</span>
+      </h1>
+
+      <p className="mx-auto mt-6 max-w-xl text-lead text-pretty text-ink-muted">
+        Vinix lee la web de cada empresa antes de escribir. Si encuentra un motivo real para
+        contactarla, redacta un email de menos de 120 palabras. Si no lo encuentra, te lo dice en
+        lugar de rellenar el hueco con un halago genérico.
+      </p>
+
+      <div className="mx-auto mt-10 grid max-w-lg gap-3 text-left">
+        {[
+          "Vas a contarnos qué vendes",
+          "Vas a elegir una empresa cualquiera",
+          "Vas a ver el email que Vinix escribiría",
+        ].map((text, i) => (
+          <div key={text} className="flex items-center gap-3 rounded-card border border-line bg-surface px-4 py-3">
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-brand-500/12 font-mono text-xs font-medium text-brand-700 dark:text-brand-400">
+              {i + 1}
+            </span>
+            <span className="text-sm text-ink">{text}</span>
+          </div>
+        ))}
+      </div>
+
+      <p className="mt-6 text-xs text-ink-subtle">Dos minutos. Sin configurar nada.</p>
+
+      <div className="mt-8 flex flex-col items-center gap-3">
+        <Button size="lg" onClick={onStart} className="w-full sm:w-auto">
+          Empezar
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M5 12h14M13 6l6 6-6 6" />
+          </svg>
+        </Button>
+        <button onClick={onSkip} className="text-xs text-ink-subtle underline-offset-4 hover:text-ink hover:underline">
+          Prefiero explorar por mi cuenta
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Paso 2: qué vendes ──────────────────────────────────────────────────────
+const OFFER_EXAMPLES = [
+  "Llenamos el calendario de discovery calls de agencias de marketing; 5-10 reuniones cualificadas al mes.",
+  "Auditamos la infraestructura cloud de startups y les recortamos entre un 30% y un 50% la factura de AWS.",
+  "Formamos a equipos de soporte para que resuelvan el 40% más de tickets sin ampliar plantilla.",
+];
+
+function OfferStep({
+  value,
+  onChange,
+  error,
+  pending,
+  onSubmit,
+  onSkip,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  error: string | null;
+  pending: boolean;
+  onSubmit: () => void;
+  onSkip: () => void;
+}) {
+  return (
+    <div className="animate-rise-in">
+      <h1 className="text-title text-balance text-ink">¿Qué vendes?</h1>
+      <p className="mt-3 leading-relaxed text-ink-muted">
+        Es lo único que el agente no puede averiguar leyendo webs ajenas. Con esto conecta el dolor
+        que detecta en cada empresa con lo que tú ofreces.
+      </p>
+
+      <div className="mt-7">
+        <label htmlFor="offer" className="mb-2 block text-sm font-medium text-ink">
+          Tu oferta, con el resultado concreto que produce
+        </label>
+        <textarea
+          id="offer"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          rows={4}
+          autoFocus
+          aria-invalid={Boolean(error)}
+          aria-describedby={error ? "offer-error" : "offer-help"}
+          placeholder="Ej.: ayudamos a agencias de diseño a conseguir reuniones con clientes de ticket alto, sin que el equipo pierda tiempo prospectando."
+          className={`w-full rounded-card border bg-surface p-4 text-sm leading-relaxed text-ink transition-colors placeholder:text-ink-subtle focus:outline-none ${
+            error ? "border-critical focus:border-critical" : "border-line focus:border-brand-500"
+          }`}
+        />
+
+        {error ? (
+          <p id="offer-error" role="alert" className="mt-2 text-xs leading-relaxed text-critical-strong">
+            {error}
+          </p>
+        ) : (
+          <p id="offer-help" className="mt-2 text-xs text-ink-subtle">
+            Cuanto más concreto sea el resultado, mejores serán los emails.
+          </p>
+        )}
+      </div>
+
+      <div className="mt-6">
+        <p className="text-micro font-semibold uppercase text-ink-subtle">O empieza desde un ejemplo</p>
+        <div className="mt-3 space-y-2">
+          {OFFER_EXAMPLES.map((example) => (
+            <button
+              key={example}
+              onClick={() => onChange(example)}
+              className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-left text-xs leading-relaxed text-ink-muted transition-all hover:border-brand-500/50 hover:text-ink"
+            >
+              {example}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-8 flex items-center justify-between gap-4">
+        <button onClick={onSkip} className="text-xs text-ink-subtle underline-offset-4 hover:text-ink hover:underline">
+          Saltar
+        </button>
+        <Button size="lg" onClick={onSubmit} disabled={pending}>
+          {pending && <Spinner className="h-4 w-4" />}
+          {pending ? "Guardando…" : "Continuar"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// ── Paso 3: elegir empresa ──────────────────────────────────────────────────
+function CompanyStep({
+  value,
+  onChange,
+  error,
+  pending,
+  onSubmit,
+  onPick,
+  onSkip,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  error: string | null;
+  pending: boolean;
+  onSubmit: () => void;
+  onPick: (url: string) => void;
+  onSkip: () => void;
+}) {
+  if (pending) return <ResearchingState />;
+
+  return (
+    <div className="animate-rise-in">
+      <h1 className="text-title text-balance text-ink">Elige una empresa cualquiera</h1>
+      <p className="mt-3 leading-relaxed text-ink-muted">
+        Vinix va a leer su web ahora mismo y a escribir el email que le mandaría. Puede ser un
+        cliente potencial real o una empresa conocida para probar.
+      </p>
+
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          onSubmit();
+        }}
+        className="mt-7"
+      >
+        <label htmlFor="company" className="mb-2 block text-sm font-medium text-ink">
+          Web de la empresa
+        </label>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <input
+            id="company"
+            type="text"
+            inputMode="url"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            autoFocus
+            aria-invalid={Boolean(error)}
+            aria-describedby={error ? "company-error" : undefined}
+            placeholder="stripe.com"
+            className={`flex-1 rounded-card border bg-surface px-4 py-3 text-sm text-ink transition-colors placeholder:text-ink-subtle focus:outline-none ${
+              error ? "border-critical focus:border-critical" : "border-line focus:border-brand-500"
+            }`}
+          />
+          <Button type="submit" size="lg" className="shrink-0">
+            Investigar
+          </Button>
+        </div>
+
+        {error && (
+          <p id="company-error" role="alert" className="mt-2 text-xs leading-relaxed text-critical-strong">
+            {error}
+          </p>
+        )}
+      </form>
+
+      <div className="mt-7">
+        <p className="text-micro font-semibold uppercase text-ink-subtle">O prueba con una de estas</p>
+        <div className="mt-3 grid gap-2 sm:grid-cols-3">
+          {SUGGESTED_COMPANIES.map((company) => (
+            <button
+              key={company.url}
+              onClick={() => onPick(company.url)}
+              className="rounded-lg border border-line bg-surface px-4 py-3 text-left transition-all hover:border-brand-500/50"
+            >
+              <span className="block text-sm font-medium text-ink">{company.name}</span>
+              <span className="mt-0.5 block text-xs text-ink-subtle">{company.hint}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-8">
+        <button onClick={onSkip} className="text-xs text-ink-subtle underline-offset-4 hover:text-ink hover:underline">
+          Saltar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Espera activa: se explica qué está pasando en cada momento. */
+function ResearchingState() {
+  const PHASES = [
+    "Abriendo su web…",
+    "Leyendo el contenido…",
+    "Buscando un motivo real para escribir…",
+    "Redactando el email…",
+  ];
+  const [phase, setPhase] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => setPhase((p) => Math.min(p + 1, PHASES.length - 1)), 2600);
+    return () => clearInterval(timer);
+  }, [PHASES.length]);
+
+  return (
+    <div className="animate-fade-in py-10 text-center">
+      <div className="relative mx-auto flex h-16 w-16 items-center justify-center">
+        <span className="absolute inline-flex h-full w-full animate-pulse-ring rounded-full bg-brand-500/30" />
+        <span className="relative flex h-12 w-12 items-center justify-center rounded-full bg-brand-500/12">
+          <Spinner className="h-5 w-5 text-brand-600 dark:text-brand-400" />
+        </span>
+      </div>
+
+      <p className="mt-6 text-heading text-ink" aria-live="polite">
+        {PHASES[phase]}
+      </p>
+      <p className="mx-auto mt-2 max-w-sm text-sm text-ink-muted">
+        Suele tardar entre 10 y 30 segundos. Estamos leyendo la web de verdad, no consultando una
+        base de datos.
+      </p>
+    </div>
+  );
+}
+
+// ── Paso 4: el resultado ────────────────────────────────────────────────────
+function ResultStep({ result, onFinish }: { result: TryResult; onFinish: () => void }) {
+  if (result.outcome === "no_hook") {
+    return (
+      <div className="animate-rise-in">
+        <div className="mb-6 flex items-center gap-2.5">
+          <span className="flex h-9 w-9 items-center justify-center rounded-full bg-caution/15 text-caution-strong">
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <path d="M12 8v5M12 17h.01" />
+            </svg>
+          </span>
+          <span className="text-micro font-semibold uppercase text-caution-strong">
+            Esto es lo que nos diferencia
+          </span>
+        </div>
+
+        <h1 className="text-title text-balance text-ink">Vinix no ha escrito nada. A propósito.</h1>
+
+        <p className="mt-4 leading-relaxed text-ink-muted">
+          No encontró en la web de <strong className="font-medium text-ink">{result.companyName}</strong>{" "}
+          nada concreto y verificable con lo que abrir un email. En lugar de rellenar el hueco con un
+          halago genérico, lo marca para que lo revises tú.
+        </p>
+
+        <div className="mt-6 rounded-card border border-caution/30 bg-caution-soft p-5">
+          <p className="text-micro font-semibold uppercase text-caution-strong">Motivo registrado</p>
+          <p className="mt-2 text-sm leading-relaxed text-ink">{result.reason}</p>
+        </div>
+
+        <div className="mt-6 rounded-card border border-line bg-surface p-5">
+          <p className="text-sm leading-relaxed text-ink-muted">
+            Cualquier otra herramienta habría generado aquí un{" "}
+            <em>&laquo;me encanta lo que hacéis en {result.companyName}&raquo;</em>. Ese es
+            exactamente el email que quema una lista y acaba en spam.
+          </p>
+        </div>
+
+        <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+          <Button size="lg" onClick={onFinish} className="w-full sm:w-auto">
+            Entendido, ir al panel
+          </Button>
+          <ButtonLink href="/bienvenida?paso=company" variant="secondary" size="lg" className="w-full sm:w-auto">
+            Probar con otra empresa
+          </ButtonLink>
+        </div>
+      </div>
+    );
+  }
+
+  const research = result.research;
+  const draft = result.draft;
+
+  return (
+    <div className="animate-rise-in">
+      <div className="mb-6 flex items-center gap-2.5">
+        <span className="flex h-9 w-9 items-center justify-center rounded-full bg-positive/15 text-positive-strong">
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20 6 9 17l-5-5" />
+          </svg>
+        </span>
+        <span className="text-micro font-semibold uppercase text-positive-strong">Tu primer email</span>
+      </div>
+
+      <h1 className="text-title text-balance text-ink">
+        Esto es lo que Vinix le escribiría a {result.companyName}
+      </h1>
+
+      {/* La investigación va PRIMERO: es la prueba de que el email no está inventado */}
+      {research && (research.painPoint || research.sector) && (
+        <div className="mt-7 rounded-card border border-line bg-surface p-5">
+          <p className="text-micro font-semibold uppercase text-ink-subtle">Lo que encontró en su web</p>
+          <dl className="mt-3 space-y-2.5">
+            {research.sector && (
+              <div className="flex gap-3 text-sm">
+                <dt className="w-24 shrink-0 text-ink-subtle">Sector</dt>
+                <dd className="text-ink">{research.sector}</dd>
+              </div>
+            )}
+            {research.size && (
+              <div className="flex gap-3 text-sm">
+                <dt className="w-24 shrink-0 text-ink-subtle">Tamaño</dt>
+                <dd className="text-ink">{research.size}</dd>
+              </div>
+            )}
+            {research.painPoint && (
+              <div className="flex gap-3 text-sm">
+                <dt className="w-24 shrink-0 text-ink-subtle">Gancho</dt>
+                <dd className="font-medium text-ink">{research.painPoint}</dd>
+              </div>
+            )}
+          </dl>
+        </div>
+      )}
+
+      {/* El email */}
+      {draft && (
+        <div className="mt-4 overflow-hidden rounded-card border border-line bg-surface">
+          <div className="border-b border-line bg-elevated px-5 py-3">
+            <p className="text-xs text-ink-subtle">Asunto</p>
+            <p className="mt-0.5 text-sm font-medium text-ink">{draft.subject}</p>
+          </div>
+          <div className="px-5 py-4">
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink">{draft.body}</p>
+          </div>
+          <div className="flex items-center justify-between border-t border-line bg-elevated px-5 py-2.5">
+            <span className="text-xs tabular-nums text-ink-subtle">{draft.wordCount} palabras</span>
+            <span className="text-xs text-positive-strong">Bajo el límite de 120</span>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-6 rounded-card border border-line bg-surface p-5">
+        <p className="text-sm leading-relaxed text-ink-muted">
+          Este borrador ya está en tu panel, pendiente de tu aprobación.{" "}
+          <strong className="font-medium text-ink">Ningún email sale sin que tú lo apruebes.</strong>
+        </p>
+      </div>
+
+      <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+        <Button size="lg" onClick={onFinish} className="w-full sm:w-auto">
+          Ir a mi panel
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M5 12h14M13 6l6 6-6 6" />
+          </svg>
+        </Button>
+        <ButtonLink href="/bienvenida?paso=company" variant="secondary" size="lg" className="w-full sm:w-auto">
+          Probar con otra empresa
+        </ButtonLink>
+      </div>
+    </div>
+  );
+}
+
+/** Se llega aquí al volver tras haber completado ya una investigación. */
+function ResumedStep({ onFinish, onRetry }: { onFinish: () => void; onRetry: () => void }) {
+  return (
+    <div className="animate-rise-in text-center">
+      <h1 className="text-title text-balance text-ink">Ya has visto a Vinix trabajar</h1>
+      <p className="mx-auto mt-3 max-w-md leading-relaxed text-ink-muted">
+        Tu primer borrador está en el panel esperando revisión. Desde ahí puedes importar el resto de
+        tus leads y configurar el remitente.
+      </p>
+      <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
+        <Button size="lg" onClick={onFinish}>
+          Ir a mi panel
+        </Button>
+        <Button variant="secondary" size="lg" onClick={onRetry}>
+          Probar otra empresa
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+export default function GuidePage() {
+  return (
+    <Suspense fallback={null}>
+      <GuideContent />
+    </Suspense>
+  );
+}

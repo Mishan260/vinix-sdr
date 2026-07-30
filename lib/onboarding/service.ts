@@ -1,0 +1,350 @@
+// lib/onboarding/service.ts
+// ============================================================================
+// Acceso a datos del onboarding: lectura del estado, registro de eventos y
+// creación de la campaña de ejemplo.
+//
+// Separado de las rutas HTTP para que la lógica se pueda probar sin levantar
+// un servidor, igual que el resto de servicios del proyecto.
+// ============================================================================
+
+import type { TypedSupabaseClient } from "@/lib/supabase/types";
+import type { TablesUpdate } from "@/lib/supabase/database.types";
+import { createServiceClient } from "@/lib/supabase/admin";
+import { logger } from "@/lib/logger";
+import { errors } from "@/lib/errors";
+import type { OnboardingSnapshot } from "./steps";
+
+/** Fila que devuelve la función SQL `onboarding_overview`. */
+interface OverviewRow {
+  welcomed_at: string | null;
+  dismissed_at: string | null;
+  completed_at: string | null;
+  value_proposition: string | null;
+  dismissed_tips: string[] | null;
+  first_campaign_at: string | null;
+  first_lead_at: string | null;
+  first_research_at: string | null;
+  first_draft_at: string | null;
+  first_send_at: string | null;
+  has_real_campaign: boolean;
+  has_demo_campaign: boolean;
+  lead_count: number;
+  researched_count: number;
+  draft_count: number;
+  sent_count: number;
+  has_sender_domain: boolean;
+}
+
+const EMPTY_SNAPSHOT: OnboardingSnapshot = {
+  welcomedAt: null,
+  dismissedAt: null,
+  completedAt: null,
+  valueProposition: null,
+  dismissedTips: [],
+  firstCampaignAt: null,
+  firstLeadAt: null,
+  firstResearchAt: null,
+  firstDraftAt: null,
+  firstSendAt: null,
+  hasRealCampaign: false,
+  hasDemoCampaign: false,
+  leadCount: 0,
+  researchedCount: 0,
+  draftCount: 0,
+  sentCount: 0,
+  hasSenderDomain: false,
+};
+
+function toSnapshot(row: OverviewRow): OnboardingSnapshot {
+  return {
+    welcomedAt: row.welcomed_at,
+    dismissedAt: row.dismissed_at,
+    completedAt: row.completed_at,
+    valueProposition: row.value_proposition,
+    dismissedTips: row.dismissed_tips ?? [],
+    firstCampaignAt: row.first_campaign_at,
+    firstLeadAt: row.first_lead_at,
+    firstResearchAt: row.first_research_at,
+    firstDraftAt: row.first_draft_at,
+    firstSendAt: row.first_send_at,
+    hasRealCampaign: row.has_real_campaign,
+    hasDemoCampaign: row.has_demo_campaign,
+    leadCount: row.lead_count,
+    researchedCount: row.researched_count,
+    draftCount: row.draft_count,
+    sentCount: row.sent_count,
+    hasSenderDomain: row.has_sender_domain,
+  };
+}
+
+/**
+ * Estado completo del onboarding en una consulta.
+ *
+ * Si la fila de progreso no existe (usuario anterior a la migración), devuelve
+ * el estado vacío en lugar de fallar: el onboarding es una ayuda, nunca debe
+ * impedir usar el producto.
+ */
+export async function loadOnboarding(db: TypedSupabaseClient, userId: string): Promise<OnboardingSnapshot> {
+  const { data, error } = await db.rpc("onboarding_overview", { p_user_id: userId });
+
+  if (error) {
+    logger.warn("onboarding.overview_failed", {
+      userId,
+      dbError: error.message,
+      impacto: "se oculta el onboarding; el producto sigue siendo usable",
+      solucion: "aplicar supabase/migrations/0009_onboarding.sql",
+    });
+    return EMPTY_SNAPSHOT;
+  }
+
+  const row = (Array.isArray(data) ? data[0] : data) as OverviewRow | undefined;
+  return row ? toSnapshot(row) : EMPTY_SNAPSHOT;
+}
+
+// ── Registro de eventos ─────────────────────────────────────────────────────
+export type OnboardingStep =
+  | "welcome_viewed"
+  | "offer_submitted"
+  | "sample_requested"
+  | "first_company_submitted"
+  | "research_started"
+  | "research_succeeded"
+  | "research_failed"
+  | "draft_viewed"
+  | "onboarding_completed"
+  | "onboarding_dismissed"
+  | "demo_data_created"
+  | "demo_data_removed";
+
+/**
+ * Registra un paso del embudo.
+ *
+ * PRIVACIDAD: nunca se guarda texto escrito por el usuario ni las empresas que
+ * investiga. Sólo el nombre del paso, cuánto tardó y un detalle acotado a
+ * valores del propio sistema (por ejemplo, el motivo de un fallo).
+ *
+ * Nunca lanza: perder una métrica no puede romper el flujo del usuario.
+ */
+export async function recordStep(
+  userId: string,
+  step: OnboardingStep,
+  options: { startedAt?: string | null; detail?: Record<string, string | number | boolean> } = {}
+): Promise<void> {
+  try {
+    const elapsedMs = options.startedAt
+      ? Math.max(0, Date.now() - new Date(options.startedAt).getTime())
+      : null;
+
+    // Service role: los eventos son de analítica y la tabla no tiene políticas
+    // de escritura para el usuario, a propósito.
+    await createServiceClient()
+      .from("onboarding_events")
+      .insert({
+        user_id: userId,
+        step,
+        elapsed_ms: elapsedMs,
+        detail: options.detail ?? null,
+      });
+  } catch (error) {
+    logger.warn("onboarding.event_failed", { userId, step, error });
+  }
+}
+
+// ── Actualización del progreso ──────────────────────────────────────────────
+export interface ProgressPatch {
+  welcomedAt?: boolean;
+  dismissedAt?: boolean;
+  completedAt?: boolean;
+  valueProposition?: string;
+  dismissTip?: string;
+}
+
+export async function updateProgress(
+  db: TypedSupabaseClient,
+  userId: string,
+  patch: ProgressPatch
+): Promise<void> {
+  // Tipado contra la tabla real: un nombre de columna equivocado no compila
+  const update: TablesUpdate<"onboarding_progress"> = {};
+  const now = new Date().toISOString();
+
+  if (patch.welcomedAt) update.welcomed_at = now;
+  if (patch.dismissedAt) update.dismissed_at = now;
+  if (patch.completedAt) update.completed_at = now;
+  if (patch.valueProposition !== undefined) update.value_proposition = patch.valueProposition;
+
+  if (patch.dismissTip) {
+    // array_append en SQL evitaría leer antes, pero PostgREST no lo expone;
+    // leer y escribir es aceptable para una acción tan poco frecuente.
+    const { data } = await db
+      .from("onboarding_progress")
+      .select("dismissed_tips")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    const current = (data?.dismissed_tips as string[] | null) ?? [];
+    if (!current.includes(patch.dismissTip)) {
+      update.dismissed_tips = [...current, patch.dismissTip];
+    }
+  }
+
+  if (Object.keys(update).length === 0) return;
+
+  const { error } = await db.from("onboarding_progress").update(update).eq("user_id", userId);
+
+  if (error) {
+    logger.warn("onboarding.progress_update_failed", { userId, dbError: error.message });
+  }
+}
+
+/**
+ * Marca el primer hito si aún no estaba marcado.
+ *
+ * Se llama desde los flujos reales (crear campaña, investigar, enviar) para
+ * poder medir «tiempo hasta el primer X». `coalesce` en SQL evitaría la
+ * lectura previa, pero requeriría una función; para una escritura que ocurre
+ * una vez por usuario y por hito, esto es más simple de mantener.
+ */
+export async function markMilestone(
+  userId: string,
+  milestone: "first_campaign_at" | "first_lead_at" | "first_research_at" | "first_draft_at" | "first_send_at"
+): Promise<void> {
+  try {
+    const admin = createServiceClient();
+    const { data } = await admin
+      .from("onboarding_progress")
+      .select(milestone)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (data && (data as Record<string, unknown>)[milestone]) return;
+
+    const patch: TablesUpdate<"onboarding_progress"> = { [milestone]: new Date().toISOString() };
+    await admin.from("onboarding_progress").update(patch).eq("user_id", userId);
+  } catch (error) {
+    logger.warn("onboarding.milestone_failed", { userId, milestone, error });
+  }
+}
+
+// ── Datos de ejemplo ────────────────────────────────────────────────────────
+/**
+ * Campaña de demostración con leads en todos los estados del pipeline.
+ *
+ * Existe para que alguien pueda evaluar el producto sin preparar un CSV ni
+ * esperar a que termine una investigación. Va marcada con `is_demo` y en
+ * estado `paused`, lo que garantiza por restricción de la base de datos que
+ * nunca enviará un email real.
+ */
+export async function createDemoData(db: TypedSupabaseClient, userId: string): Promise<{ campaignId: string }> {
+  const { data: existing } = await db
+    .from("campaigns")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("is_demo", true)
+    .maybeSingle();
+
+  if (existing) return { campaignId: existing.id };
+
+  const { data: campaign, error } = await db
+    .from("campaigns")
+    .insert({
+      user_id: userId,
+      name: "Ejemplo · Agencias de diseño",
+      value_proposition:
+        "Llenamos el calendario de reuniones cualificadas de agencias de diseño, sin que el equipo pierda tiempo prospectando.",
+      sender_name: "Tu nombre",
+      sender_email: "",
+      base_template: "",
+      is_demo: true,
+      // `paused` es obligatorio para las demo: la restricción
+      // campaigns_demo_never_sends lo impone en la base de datos.
+      status: "paused",
+    })
+    .select("id")
+    .single();
+
+  if (error || !campaign) throw errors.internal(error);
+
+  const leads = [
+    {
+      company_name: "Estudio Nórdico",
+      company_url: "https://estudionordico.example",
+      contact_name: "Marta Puig",
+      contact_email: "marta@estudionordico.example",
+      status: "ready_to_send" as const,
+      research_sector: "Agencia de diseño de marca",
+      research_size: "pyme, ~12 personas",
+      research_pain_point: "Acaban de abrir oficina en Madrid y buscan dos perfiles comerciales",
+      draft_subject: "lo de vuestra oficina en Madrid",
+      draft_body:
+        "Marta, he visto que acabáis de abrir en Madrid y estáis buscando perfiles comerciales.\n\n" +
+        "Mientras esos fichajes llegan, nosotros llenamos el calendario de reuniones de agencias como la vuestra.\n\n" +
+        "¿Es algo relevante para vosotros ahora mismo?\n\nTu nombre",
+    },
+    {
+      company_name: "Taller Gráfico Sur",
+      company_url: "https://tallergraficosur.example",
+      contact_name: null,
+      contact_email: "hola@tallergraficosur.example",
+      status: "research_failed" as const,
+      research_error:
+        "Investigación sin hook específico ni dolor detectado; revisar manualmente.",
+      research_sector: null,
+      research_size: null,
+      research_pain_point: null,
+      draft_subject: null,
+      draft_body: null,
+    },
+    {
+      company_name: "Mediterrani Apps",
+      company_url: "https://mediterrani.example",
+      contact_name: null,
+      contact_email: "dir@mediterrani.example",
+      status: "interested" as const,
+      research_sector: "Desarrollo de aplicaciones",
+      research_size: "scale-up en expansión",
+      research_pain_point: "Anunciaron expansión al mercado francés en su blog",
+      draft_subject: null,
+      draft_body: null,
+    },
+    {
+      company_name: "Pixel & Co",
+      company_url: "https://pixelco.example",
+      contact_name: "Anna Serra",
+      contact_email: "anna@pixelco.example",
+      status: "pending" as const,
+      research_sector: null,
+      research_size: null,
+      research_pain_point: null,
+      draft_subject: null,
+      draft_body: null,
+    },
+  ];
+
+  const { error: leadsError } = await db
+    .from("leads")
+    .insert(leads.map((lead) => ({ ...lead, campaign_id: campaign.id })));
+
+  if (leadsError) {
+    // Sin leads la campaña de ejemplo no enseña nada: se deshace para no
+    // dejar una campaña vacía y confusa.
+    await db.from("campaigns").delete().eq("id", campaign.id);
+    throw errors.internal(leadsError);
+  }
+
+  logger.info("onboarding.demo_created", { userId, campaignId: campaign.id });
+  return { campaignId: campaign.id };
+}
+
+export async function removeDemoData(db: TypedSupabaseClient, userId: string): Promise<number> {
+  // Los leads caen en cascada al borrar la campaña
+  const { data, error } = await db
+    .from("campaigns")
+    .delete()
+    .eq("user_id", userId)
+    .eq("is_demo", true)
+    .select("id");
+
+  if (error) throw errors.internal(error);
+  return data?.length ?? 0;
+}
