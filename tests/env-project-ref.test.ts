@@ -58,6 +58,9 @@ describe("findProjectRefMismatches", () => {
     expect(result).toEqual([]);
   });
 
+  // Los refs de aquí abajo son la reproducción literal del incidente, dentro de
+  // JWT falsos sin firma válida. Es la ÚNICA aparición del proyecto antiguo en
+  // todo el repositorio, y está para impedir que vuelva, no para usarlo.
   it("detecta el caso real: URL nueva con claves del proyecto viejo", () => {
     const result = findProjectRefMismatches({
       SUPABASE_URL: "https://riygxhnrmarvkvrieijd.supabase.co",

@@ -23,6 +23,8 @@ const snapshot = (over: Partial<OnboardingSnapshot> = {}): OnboardingSnapshot =>
   dismissedAt: null,
   completedAt: null,
   valueProposition: null,
+  targetAudience: null,
+  mainProduct: null,
   dismissedTips: [],
   firstCampaignAt: null,
   firstLeadAt: null,

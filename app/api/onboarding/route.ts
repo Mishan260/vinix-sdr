@@ -37,6 +37,8 @@ const progressSchema = z
     dismiss: z.boolean().optional(),
     complete: z.boolean().optional(),
     valueProposition: z.string().trim().max(2000, "Máximo 2000 caracteres").optional(),
+    targetAudience: z.string().trim().max(2000, "Máximo 2000 caracteres").optional(),
+    mainProduct: z.string().trim().max(2000, "Máximo 2000 caracteres").optional(),
     dismissTip: z.string().trim().max(60).optional(),
   })
   .strict()
@@ -64,6 +66,8 @@ export const POST = authedRoute(
       dismissedAt: body.dismiss,
       completedAt: body.complete,
       valueProposition: body.valueProposition,
+      targetAudience: body.targetAudience,
+      mainProduct: body.mainProduct,
       dismissTip: body.dismissTip,
     });
 

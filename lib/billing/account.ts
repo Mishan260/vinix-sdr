@@ -60,30 +60,26 @@ export function monthStart(now: Date = new Date()): Date {
 export async function loadAccount(db: TypedSupabaseClient, userId: string): Promise<AccountState> {
   const { data, error } = await db.rpc("account_overview", { p_user_id: userId });
 
+  // La función agregada es una optimización, no un requisito. Si falta (una
+  // migración a medias), lanzar dejaba inutilizables crear campañas, importar,
+  // exportar y los seguimientos. Se cae al camino lento en su lugar.
   if (error) {
-    logger.error("billing.account.overview_failed", {
+    logger.warn("billing.account.overview_unavailable", {
       userId,
       dbError: error.message,
       dbErrorCode: error.code,
-      solucion: "aplicar supabase/migrations/0006_account_overview.sql",
+      accion: "leyendo las tablas directamente",
+      solucion: "aplicar supabase/migrations/0006_account_overview.sql para el camino rápido",
     });
-    throw errors.internal(error);
+    return loadAccountFallback(db, userId);
   }
 
   // La función devuelve siempre exactamente una fila (LEFT JOIN sobre un ancla)
   const overview = Array.isArray(data) ? data[0] : data;
 
   if (!overview) {
-    logger.error("billing.account.overview_empty", {
-      userId,
-      impacto: "no se pudo determinar el plan; se aplica el más restrictivo",
-    });
-    return {
-      effective: resolvePlan(FALLBACK_ACCOUNT),
-      usage: { campaigns: 0, leadsThisMonth: 0 },
-      stripeCustomerId: null,
-      eligibleForTrial: true,
-    };
+    logger.warn("billing.account.overview_empty", { userId, accion: "leyendo las tablas directamente" });
+    return loadAccountFallback(db, userId);
   }
 
   // `plan` llega como 'free' cuando no existe fila en `accounts`. Distinguir
@@ -110,6 +106,67 @@ export async function loadAccount(db: TypedSupabaseClient, userId: string): Prom
     },
     stripeCustomerId: overview.stripe_customer_id ?? null,
     eligibleForTrial: !overview.has_subscription,
+  };
+}
+
+/**
+ * Camino lento: reconstruye el estado de la cuenta leyendo las tablas.
+ *
+ * Sólo se recorre cuando `account_overview` no está disponible. Además crea la
+ * fila de `accounts` si el trigger de alta no llegó a ejecutarse, para que un
+ * usuario registrado antes de la migración no quede atrapado en plan Free.
+ */
+async function loadAccountFallback(db: TypedSupabaseClient, userId: string): Promise<AccountState> {
+  const [accountResult, campaignsResult, subscriptionResult] = await Promise.all([
+    db
+      .from("accounts")
+      .select("plan, trial_ends_at, stripe_customer_id")
+      .eq("user_id", userId)
+      .maybeSingle(),
+    db.from("campaigns").select("id, is_demo").eq("user_id", userId),
+    db.from("subscriptions").select("id", { count: "exact", head: true }).eq("user_id", userId),
+  ]);
+
+  let account = accountResult.data;
+
+  // Sin fila la cuenta caería a Free en silencio: se crea con su trial
+  if (!account) {
+    logger.warn("billing.account.row_missing", {
+      userId,
+      accion: "creando la fila de cuenta con el trial por defecto",
+    });
+
+    const { data: created } = await db
+      .from("accounts")
+      .insert({ user_id: userId })
+      .select("plan, trial_ends_at, stripe_customer_id")
+      .maybeSingle();
+
+    account = created ?? null;
+  }
+
+  const campaigns = (campaignsResult.data ?? []).filter((c) => !c.is_demo);
+  const campaignIds = campaigns.map((c) => c.id);
+
+  let leadsThisMonth = 0;
+  if (campaignIds.length > 0) {
+    const { count } = await db
+      .from("leads")
+      .select("id", { count: "exact", head: true })
+      .in("campaign_id", campaignIds)
+      .gte("created_at", monthStart().toISOString());
+    leadsThisMonth = count ?? 0;
+  }
+
+  return {
+    effective: resolvePlan(
+      account
+        ? { plan: account.plan, trial_ends_at: account.trial_ends_at }
+        : FALLBACK_ACCOUNT
+    ),
+    usage: { campaigns: campaigns.length, leadsThisMonth },
+    stripeCustomerId: account?.stripe_customer_id ?? null,
+    eligibleForTrial: (subscriptionResult.count ?? 0) === 0,
   };
 }
 

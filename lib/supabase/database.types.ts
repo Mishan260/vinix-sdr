@@ -121,6 +121,8 @@ export interface Database {
           dismissed_at: string | null;
           completed_at: string | null;
           value_proposition: string | null;
+          target_audience: string | null;
+          main_product: string | null;
           first_campaign_at: string | null;
           first_lead_at: string | null;
           first_research_at: string | null;
@@ -136,6 +138,8 @@ export interface Database {
           dismissed_at?: string | null;
           completed_at?: string | null;
           value_proposition?: string | null;
+          target_audience?: string | null;
+          main_product?: string | null;
           first_campaign_at?: string | null;
           first_lead_at?: string | null;
           first_research_at?: string | null;
@@ -151,6 +155,8 @@ export interface Database {
           dismissed_at?: string | null;
           completed_at?: string | null;
           value_proposition?: string | null;
+          target_audience?: string | null;
+          main_product?: string | null;
           first_campaign_at?: string | null;
           first_lead_at?: string | null;
           first_research_at?: string | null;
@@ -531,6 +537,8 @@ export interface Database {
           dismissed_at: string | null;
           completed_at: string | null;
           value_proposition: string | null;
+          target_audience: string | null;
+          main_product: string | null;
           dismissed_tips: string[] | null;
           first_campaign_at: string | null;
           first_lead_at: string | null;

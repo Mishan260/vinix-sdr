@@ -7,10 +7,31 @@ import { getBrowserClient } from "@/lib/supabase/browser";
 import { AuthShell, Field, FormAlert, SubmitButton } from "@/components/auth-shell";
 import { signInSchema } from "@/lib/validation/schemas";
 
+/**
+ * Motivos que puede devolver /auth/callback.
+ *
+ * Cada mensaje dice qué pasó y qué puede hacer el usuario ahora. Un
+ * «enlace inválido» a secas deja a la gente atascada sin saber si el problema
+ * es suyo, del correo o del producto.
+ */
+const MOTIVOS_CALLBACK: Record<string, string> = {
+  enlace_caducado:
+    "El enlace de confirmación ha caducado. Los enlaces duran 24 horas por seguridad. Vuelve a registrarte con el mismo email y te enviaremos uno nuevo.",
+  enlace_invalido:
+    "Este enlace ya se ha usado o no es válido. Si ya confirmaste tu cuenta, inicia sesión normalmente abajo.",
+  otro_navegador:
+    "Has abierto el enlace en un navegador distinto al que usaste para registrarte. Tu cuenta está bien: inicia sesión aquí con tu email y contraseña.",
+  enlace_incompleto:
+    "El enlace de confirmación llegó incompleto. Suele pasar cuando el correo lo parte en dos líneas: cópialo entero en la barra de direcciones.",
+  error_inesperado:
+    "No hemos podido completar la verificación. Inténtalo de nuevo en unos minutos; si sigue fallando, inicia sesión y escríbenos.",
+};
+
 function LoginForm() {
   const router = useRouter();
   const params = useSearchParams();
   const next = params.get("next") ?? "/dashboard";
+  const motivo = MOTIVOS_CALLBACK[params.get("motivo") ?? ""] ?? null;
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -81,6 +102,11 @@ function LoginForm() {
       {params.get("reset") === "1" && (
         <FormAlert variant="success">Contraseña actualizada. Ya puedes iniciar sesión.</FormAlert>
       )}
+
+      {/* Motivos que llegan del callback de confirmación. Sin esto, un enlace
+          caducado dejaba al usuario en esta pantalla sin ninguna explicación. */}
+      {motivo && <FormAlert variant="error">{motivo}</FormAlert>}
+
       {formError && <FormAlert variant="error">{formError}</FormAlert>}
 
       <form onSubmit={onSubmit} noValidate>

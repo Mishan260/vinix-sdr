@@ -20,6 +20,8 @@ interface OverviewRow {
   dismissed_at: string | null;
   completed_at: string | null;
   value_proposition: string | null;
+  target_audience: string | null;
+  main_product: string | null;
   dismissed_tips: string[] | null;
   first_campaign_at: string | null;
   first_lead_at: string | null;
@@ -40,6 +42,8 @@ const EMPTY_SNAPSHOT: OnboardingSnapshot = {
   dismissedAt: null,
   completedAt: null,
   valueProposition: null,
+  targetAudience: null,
+  mainProduct: null,
   dismissedTips: [],
   firstCampaignAt: null,
   firstLeadAt: null,
@@ -61,6 +65,8 @@ function toSnapshot(row: OverviewRow): OnboardingSnapshot {
     dismissedAt: row.dismissed_at,
     completedAt: row.completed_at,
     valueProposition: row.value_proposition,
+    targetAudience: row.target_audience ?? null,
+    mainProduct: row.main_product ?? null,
     dismissedTips: row.dismissed_tips ?? [],
     firstCampaignAt: row.first_campaign_at,
     firstLeadAt: row.first_lead_at,
@@ -87,18 +93,108 @@ function toSnapshot(row: OverviewRow): OnboardingSnapshot {
 export async function loadOnboarding(db: TypedSupabaseClient, userId: string): Promise<OnboardingSnapshot> {
   const { data, error } = await db.rpc("onboarding_overview", { p_user_id: userId });
 
-  if (error) {
-    logger.warn("onboarding.overview_failed", {
-      userId,
-      dbError: error.message,
-      impacto: "se oculta el onboarding; el producto sigue siendo usable",
-      solucion: "aplicar supabase/migrations/0009_onboarding.sql",
-    });
-    return EMPTY_SNAPSHOT;
+  if (!error) {
+    const row = (Array.isArray(data) ? data[0] : data) as OverviewRow | undefined;
+    if (row) return toSnapshot(row);
+    // Sin fila: el trigger de alta no llegó a crear el registro de progreso
+    return ensureProgressRow(db, userId);
   }
 
-  const row = (Array.isArray(data) ? data[0] : data) as OverviewRow | undefined;
-  return row ? toSnapshot(row) : EMPTY_SNAPSHOT;
+  // La función agregada es una OPTIMIZACIÓN, no un requisito.
+  //
+  // Devolver estado vacío cuando falta hacía que `valueProposition` fuese
+  // siempre null, y el usuario recibía «necesitamos saber qué vendes» aunque
+  // ya lo hubiera rellenado. Se leen las tablas directamente en su lugar.
+  logger.warn("onboarding.overview_unavailable", {
+    userId,
+    dbError: error.message,
+    accion: "leyendo las tablas directamente",
+    solucion: "aplicar supabase/migrations/0009_onboarding.sql para el camino rápido",
+  });
+
+  return loadOnboardingFallback(db, userId);
+}
+
+/**
+ * Columnas del progreso persistido.
+ * Literal en una sola línea a propósito: concatenar con `+` impide que
+ * supabase-js infiera los tipos de las columnas seleccionadas.
+ */
+const PROGRESS_COLUMNS =
+  "welcomed_at, dismissed_at, completed_at, value_proposition, target_audience, main_product, dismissed_tips, first_campaign_at, first_lead_at, first_research_at, first_draft_at, first_send_at";
+
+/** Crea la fila de progreso si el trigger de alta no llegó a ejecutarse. */
+async function ensureProgressRow(db: TypedSupabaseClient, userId: string): Promise<OnboardingSnapshot> {
+  const { error } = await db.from("onboarding_progress").insert({ user_id: userId });
+  // 23505 = clave duplicada: otra petición simultánea ya la creó
+  if (error && error.code !== "23505") {
+    logger.warn("onboarding.progress_create_failed", { userId, dbError: error.message });
+  }
+  return EMPTY_SNAPSHOT;
+}
+
+/**
+ * Camino lento: reconstruye el estado leyendo las tablas.
+ *
+ * Más consultas que la función agregada, pero sólo se recorre cuando esa
+ * función no está disponible. Preferible a dejar el producto inutilizable.
+ */
+async function loadOnboardingFallback(
+  db: TypedSupabaseClient,
+  userId: string
+): Promise<OnboardingSnapshot> {
+  const [progressResult, campaignsResult] = await Promise.all([
+    db.from("onboarding_progress").select(PROGRESS_COLUMNS).eq("user_id", userId).maybeSingle(),
+    db.from("campaigns").select("id, is_demo, sender_email").eq("user_id", userId),
+  ]);
+
+  const progress = progressResult.data;
+  if (!progress) return ensureProgressRow(db, userId);
+
+  const campaigns = campaignsResult.data ?? [];
+  const realCampaigns = campaigns.filter((c) => !c.is_demo);
+  const realIds = realCampaigns.map((c) => c.id);
+
+  let leadCount = 0;
+  let researchedCount = 0;
+  let draftCount = 0;
+  let sentCount = 0;
+
+  if (realIds.length > 0) {
+    const [leads, sent] = await Promise.all([
+      db.from("leads").select("status, draft_body").in("campaign_id", realIds),
+      db.from("emails_sent").select("id", { count: "exact", head: true }).in("campaign_id", realIds),
+    ]);
+
+    for (const lead of leads.data ?? []) {
+      leadCount++;
+      if (lead.status !== "pending" && lead.status !== "researching") researchedCount++;
+      if (lead.draft_body) draftCount++;
+    }
+    sentCount = sent.count ?? 0;
+  }
+
+  return {
+    welcomedAt: progress.welcomed_at,
+    dismissedAt: progress.dismissed_at,
+    completedAt: progress.completed_at,
+    valueProposition: progress.value_proposition,
+    targetAudience: progress.target_audience ?? null,
+    mainProduct: progress.main_product ?? null,
+    dismissedTips: progress.dismissed_tips ?? [],
+    firstCampaignAt: progress.first_campaign_at,
+    firstLeadAt: progress.first_lead_at,
+    firstResearchAt: progress.first_research_at,
+    firstDraftAt: progress.first_draft_at,
+    firstSendAt: progress.first_send_at,
+    hasRealCampaign: realCampaigns.length > 0,
+    hasDemoCampaign: campaigns.some((c) => c.is_demo),
+    leadCount,
+    researchedCount,
+    draftCount,
+    sentCount,
+    hasSenderDomain: realCampaigns.some((c) => (c.sender_email ?? "") !== ""),
+  };
 }
 
 // ── Registro de eventos ─────────────────────────────────────────────────────
@@ -156,6 +252,8 @@ export interface ProgressPatch {
   dismissedAt?: boolean;
   completedAt?: boolean;
   valueProposition?: string;
+  targetAudience?: string;
+  mainProduct?: string;
   dismissTip?: string;
 }
 
@@ -172,6 +270,8 @@ export async function updateProgress(
   if (patch.dismissedAt) update.dismissed_at = now;
   if (patch.completedAt) update.completed_at = now;
   if (patch.valueProposition !== undefined) update.value_proposition = patch.valueProposition;
+  if (patch.targetAudience !== undefined) update.target_audience = patch.targetAudience;
+  if (patch.mainProduct !== undefined) update.main_product = patch.mainProduct;
 
   if (patch.dismissTip) {
     // array_append en SQL evitaría leer antes, pero PostgREST no lo expone;

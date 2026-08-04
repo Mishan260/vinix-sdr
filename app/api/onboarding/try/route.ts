@@ -20,8 +20,13 @@ import { authedRoute, fromDbError } from "@/lib/api/handler";
 import { companyUrlSchema } from "@/lib/validation/schemas";
 import { researchAndDraft } from "@/lib/agent/graph";
 import { loadOnboarding, markMilestone, recordStep } from "@/lib/onboarding/service";
+import {
+  composeValueProposition,
+  needsProfile,
+  PROFILE_QUESTIONS,
+  type CompanyProfile,
+} from "@/lib/onboarding/profile";
 import { assertCanCreateCampaign, loadAccount } from "@/lib/billing/account";
-import { errors } from "@/lib/errors";
 
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
@@ -50,12 +55,26 @@ export const POST = authedRoute(
   async ({ body, db, user, log }) => {
     const onboarding = await loadOnboarding(db, user.id);
 
-    const valueProposition = onboarding.valueProposition?.trim();
-    if (!valueProposition) {
-      throw errors.validation(
-        "Antes de investigar necesitamos saber qué vendes: es lo único que el agente no puede deducir leyendo la web de otra empresa."
-      );
+    const profile: CompanyProfile = {
+      valueProposition: onboarding.valueProposition,
+      targetAudience: onboarding.targetAudience,
+      mainProduct: onboarding.mainProduct,
+    };
+
+    // Falta el perfil: NO es un error. El usuario ha hecho lo correcto —
+    // pedir una investigación— y lo que falta es un dato que aún no le hemos
+    // preguntado. Se devuelve 200 con la empresa pendiente para que la
+    // interfaz abra el asistente y reanude sola al terminar.
+    if (needsProfile(profile)) {
+      log.info("onboarding.try.profile_required", { pendingUrl: body.companyUrl });
+      return {
+        outcome: "needs_profile" as const,
+        pendingCompanyUrl: body.companyUrl,
+        questions: PROFILE_QUESTIONS,
+      };
     }
+
+    const valueProposition = composeValueProposition(profile);
 
     await recordStep(user.id, "first_company_submitted", { startedAt: body.startedAt });
 

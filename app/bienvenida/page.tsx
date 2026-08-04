@@ -18,6 +18,7 @@ import { Button, ButtonLink, Logo } from "@/components/brand";
 import { Spinner, ToastStack } from "@/components/ui";
 import { useToasts } from "@/lib/hooks/use-toasts";
 import { GUIDED_STEPS, SUGGESTED_COMPANIES, type GuidedStep } from "@/lib/onboarding/steps";
+import { PROFILE_QUESTIONS } from "@/lib/onboarding/profile";
 
 interface TryResult {
   outcome: "drafted" | "no_hook";
@@ -42,7 +43,15 @@ function GuideContent() {
   const [step, setStep] = useState<GuidedStep>("welcome");
   const [loadingState, setLoadingState] = useState(true);
 
-  const [offer, setOffer] = useState("");
+  /** Llega desde /auth/callback tras confirmar el email. */
+  const verificado = params.get("verificado") === "1";
+
+  // Perfil de empresa: las tres cosas que el agente no puede deducir solo
+  const [profile, setProfile] = useState<CompanyProfileForm>({
+    valueProposition: "",
+    targetAudience: "",
+    mainProduct: "",
+  });
   const [offerError, setOfferError] = useState<string | null>(null);
   const [savingOffer, setSavingOffer] = useState(false);
 
@@ -50,6 +59,10 @@ function GuideContent() {
   const [companyError, setCompanyError] = useState<string | null>(null);
   const [researching, setResearching] = useState(false);
   const [result, setResult] = useState<TryResult | null>(null);
+
+  // Empresa que el usuario pidió investigar antes de que le pidiéramos el
+  // perfil. Se guarda para reanudar automáticamente y no perder su trabajo.
+  const [pendingCompany, setPendingCompany] = useState<string | null>(null);
 
   // Instante en que arrancó el recorrido: permite medir cuánto tarda cada paso
   const startedAt = useRef(new Date().toISOString());
@@ -76,7 +89,12 @@ function GuideContent() {
         }
         const data = await res.json();
 
-        if (data.snapshot?.valueProposition) setOffer(data.snapshot.valueProposition);
+        // Si ya respondió antes, se rellena y no se vuelve a preguntar
+        setProfile({
+          valueProposition: data.snapshot?.valueProposition ?? "",
+          targetAudience: data.snapshot?.targetAudience ?? "",
+          mainProduct: data.snapshot?.mainProduct ?? "",
+        });
 
         // El parámetro de la URL sólo puede adelantar a un paso ya alcanzable
         const requested = params.get("paso") as GuidedStep | null;
@@ -97,13 +115,13 @@ function GuideContent() {
     void post({ markWelcomed: true, event: "welcome_viewed", startedAt: startedAt.current });
   }
 
-  // ── Paso 2: qué vendes ────────────────────────────────────────────────────
-  async function submitOffer() {
-    const value = offer.trim();
+  // ── Paso 2: perfil de empresa ─────────────────────────────────────────────
+  async function submitProfile() {
+    const oferta = profile.valueProposition.trim();
 
-    if (value.length < 15) {
+    if (oferta.length < 15) {
       setOfferError(
-        "Necesitamos un poco más de detalle. Describe qué vendes y con qué resultado concreto: es lo que el agente usará para conectar tu oferta con el dolor de cada empresa."
+        "Necesitamos un poco más de detalle en la primera pregunta. Describe qué vendes y con qué resultado concreto: es lo que el agente usará para conectar tu oferta con el dolor de cada empresa."
       );
       return;
     }
@@ -112,14 +130,31 @@ function GuideContent() {
     setSavingOffer(true);
     try {
       const data = await post({
-        valueProposition: value,
+        valueProposition: oferta,
+        targetAudience: profile.targetAudience.trim(),
+        mainProduct: profile.mainProduct.trim(),
         event: "offer_submitted",
         startedAt: startedAt.current,
       });
+
       if (!data) {
-        setOfferError("No se pudo guardar. Comprueba tu conexión e inténtalo de nuevo.");
+        setOfferError(
+          "No hemos podido guardar tus respuestas. Comprueba tu conexión e inténtalo de nuevo; no se ha perdido lo que has escrito."
+        );
         return;
       }
+
+      // Si llegó aquí porque pidió investigar una empresa antes de tener
+      // perfil, se reanuda esa investigación sola. Su trabajo no se pierde.
+      if (pendingCompany) {
+        const url = pendingCompany;
+        setPendingCompany(null);
+        setCompanyUrl(url);
+        setStep("company");
+        await runResearch(url);
+        return;
+      }
+
       setStep("company");
     } finally {
       setSavingOffer(false);
@@ -149,6 +184,14 @@ function GuideContent() {
           data?.error ??
             "No se pudo completar la investigación. Prueba con otra empresa o inténtalo de nuevo en un momento."
         );
+        return;
+      }
+
+      // Falta el perfil: no es un fallo. Se guarda la empresa que pidió y se
+      // le llevan las preguntas; al responder, la investigación se reanuda sola.
+      if (data.outcome === "needs_profile") {
+        setPendingCompany(data.pendingCompanyUrl ?? target);
+        setStep("offer");
         return;
       }
 
@@ -214,15 +257,37 @@ function GuideContent() {
 
       <main className="flex flex-1 items-center justify-center px-5 py-10 sm:px-8">
         <div className="w-full max-w-2xl">
+          {/* Confirmación de la cuenta recién verificada. Antes el usuario
+              volvía del email sin ninguna señal de que hubiera funcionado. */}
+          {verificado && (
+            <div
+              role="status"
+              className="animate-rise-in mb-8 flex items-start gap-3 rounded-card border border-positive/30 bg-positive-soft px-4 py-3.5"
+            >
+              <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-positive/20 text-positive-strong">
+                <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M20 6 9 17l-5-5" />
+                </svg>
+              </span>
+              <div>
+                <p className="text-sm font-medium text-ink">Cuenta verificada correctamente</p>
+                <p className="mt-0.5 text-xs leading-relaxed text-ink-muted">
+                  Ya puedes empezar a utilizar Vinix.
+                </p>
+              </div>
+            </div>
+          )}
+
           {step === "welcome" && <WelcomeStep onStart={startGuide} onSkip={skip} />}
 
           {step === "offer" && (
-            <OfferStep
-              value={offer}
-              onChange={setOffer}
+            <ProfileStep
+              profile={profile}
+              onChange={setProfile}
               error={offerError}
               pending={savingOffer}
-              onSubmit={submitOffer}
+              pendingCompany={pendingCompany}
+              onSubmit={submitProfile}
               onSkip={skip}
             />
           )}
@@ -308,78 +373,122 @@ function WelcomeStep({ onStart, onSkip }: { onStart: () => void; onSkip: () => v
   );
 }
 
-// ── Paso 2: qué vendes ──────────────────────────────────────────────────────
+// ── Paso 2: perfil de empresa ───────────────────────────────────────────────
 const OFFER_EXAMPLES = [
   "Llenamos el calendario de discovery calls de agencias de marketing; 5-10 reuniones cualificadas al mes.",
   "Auditamos la infraestructura cloud de startups y les recortamos entre un 30% y un 50% la factura de AWS.",
   "Formamos a equipos de soporte para que resuelvan el 40% más de tickets sin ampliar plantilla.",
 ];
 
-function OfferStep({
-  value,
+interface CompanyProfileForm {
+  valueProposition: string;
+  targetAudience: string;
+  mainProduct: string;
+}
+
+function ProfileStep({
+  profile,
   onChange,
   error,
   pending,
+  pendingCompany,
   onSubmit,
   onSkip,
 }: {
-  value: string;
-  onChange: (v: string) => void;
+  profile: CompanyProfileForm;
+  onChange: (p: CompanyProfileForm) => void;
   error: string | null;
   pending: boolean;
+  /** Empresa que el usuario ya pidió investigar; se reanudará al guardar. */
+  pendingCompany: string | null;
   onSubmit: () => void;
   onSkip: () => void;
 }) {
+  const set = (campo: keyof CompanyProfileForm) => (valor: string) =>
+    onChange({ ...profile, [campo]: valor });
+
   return (
     <div className="animate-rise-in">
-      <h1 className="text-title text-balance text-ink">¿Qué vendes?</h1>
+      {/* Si viene de pedir una investigación, se explica por qué se le
+          interrumpe y se le promete continuar donde estaba. */}
+      {pendingCompany && (
+        <div className="mb-6 flex items-start gap-3 rounded-card border border-brand-500/25 bg-brand-500/[0.06] px-4 py-3">
+          <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-brand-500/15 text-brand-700 dark:text-brand-400">
+            <svg viewBox="0 0 24 24" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <path d="M12 16v-4M12 8h.01" />
+            </svg>
+          </span>
+          <p className="text-xs leading-relaxed text-ink-muted">
+            Antes de investigar <strong className="font-medium text-ink">{pendingCompany}</strong>{" "}
+            necesitamos conocer tu oferta. En cuanto respondas seguimos por donde ibas,
+            automáticamente.
+          </p>
+        </div>
+      )}
+
+      <h1 className="text-title text-balance text-ink">Cuéntanos de tu empresa</h1>
       <p className="mt-3 leading-relaxed text-ink-muted">
-        Es lo único que el agente no puede averiguar leyendo webs ajenas. Con esto conecta el dolor
-        que detecta en cada empresa con lo que tú ofreces.
+        Son las tres cosas que el agente no puede averiguar leyendo webs ajenas. Te lo preguntamos
+        una vez y no volvemos a hacerlo.
       </p>
 
-      <div className="mt-7">
-        <label htmlFor="offer" className="mb-2 block text-sm font-medium text-ink">
-          Tu oferta, con el resultado concreto que produce
-        </label>
-        <textarea
-          id="offer"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          rows={4}
-          autoFocus
-          aria-invalid={Boolean(error)}
-          aria-describedby={error ? "offer-error" : "offer-help"}
-          placeholder="Ej.: ayudamos a agencias de diseño a conseguir reuniones con clientes de ticket alto, sin que el equipo pierda tiempo prospectando."
-          className={`w-full rounded-card border bg-surface p-4 text-sm leading-relaxed text-ink transition-colors placeholder:text-ink-subtle focus:outline-none ${
-            error ? "border-critical focus:border-critical" : "border-line focus:border-brand-500"
-          }`}
-        />
+      <div className="mt-7 space-y-6">
+        {PROFILE_QUESTIONS.map((question, index) => {
+          const campo = question.id as keyof CompanyProfileForm;
+          const esPrimera = index === 0;
+          const errorAqui = esPrimera ? error : null;
 
-        {error ? (
-          <p id="offer-error" role="alert" className="mt-2 text-xs leading-relaxed text-critical-strong">
-            {error}
-          </p>
-        ) : (
-          <p id="offer-help" className="mt-2 text-xs text-ink-subtle">
-            Cuanto más concreto sea el resultado, mejores serán los emails.
-          </p>
-        )}
-      </div>
+          return (
+            <div key={question.id}>
+              <label htmlFor={question.id} className="mb-1 block text-sm font-medium text-ink">
+                {question.label}
+                {!question.required && (
+                  <span className="ml-2 text-xs font-normal text-ink-subtle">(opcional)</span>
+                )}
+              </label>
+              <p className="mb-2 text-xs leading-relaxed text-ink-subtle">{question.help}</p>
 
-      <div className="mt-6">
-        <p className="text-micro font-semibold uppercase text-ink-subtle">O empieza desde un ejemplo</p>
-        <div className="mt-3 space-y-2">
-          {OFFER_EXAMPLES.map((example) => (
-            <button
-              key={example}
-              onClick={() => onChange(example)}
-              className="w-full rounded-lg border border-line bg-surface px-4 py-3 text-left text-xs leading-relaxed text-ink-muted transition-all hover:border-brand-500/50 hover:text-ink"
-            >
-              {example}
-            </button>
-          ))}
-        </div>
+              <textarea
+                id={question.id}
+                value={profile[campo]}
+                onChange={(e) => set(campo)(e.target.value)}
+                rows={esPrimera ? 3 : 2}
+                autoFocus={esPrimera}
+                aria-invalid={Boolean(errorAqui)}
+                aria-describedby={errorAqui ? `${question.id}-error` : undefined}
+                placeholder={question.placeholder}
+                className={`w-full rounded-card border bg-surface p-3.5 text-sm leading-relaxed text-ink transition-colors placeholder:text-ink-subtle focus:outline-none ${
+                  errorAqui ? "border-critical focus:border-critical" : "border-line focus:border-brand-500"
+                }`}
+              />
+
+              {errorAqui && (
+                <p id={`${question.id}-error`} role="alert" className="mt-2 text-xs leading-relaxed text-critical-strong">
+                  {errorAqui}
+                </p>
+              )}
+
+              {/* Los ejemplos sólo en la primera: es la que cuesta arrancar */}
+              {esPrimera && (
+                <div className="mt-3">
+                  <p className="text-micro font-semibold uppercase text-ink-subtle">O empieza desde un ejemplo</p>
+                  <div className="mt-2 space-y-2">
+                    {OFFER_EXAMPLES.map((example) => (
+                      <button
+                        key={example}
+                        type="button"
+                        onClick={() => set("valueProposition")(example)}
+                        className="w-full rounded-lg border border-line bg-surface px-4 py-2.5 text-left text-xs leading-relaxed text-ink-muted transition-all hover:border-brand-500/50 hover:text-ink"
+                      >
+                        {example}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       <div className="mt-8 flex items-center justify-between gap-4">
@@ -388,7 +497,7 @@ function OfferStep({
         </button>
         <Button size="lg" onClick={onSubmit} disabled={pending}>
           {pending && <Spinner className="h-4 w-4" />}
-          {pending ? "Guardando…" : "Continuar"}
+          {pending ? "Guardando…" : pendingCompany ? "Guardar y continuar" : "Continuar"}
         </Button>
       </div>
     </div>

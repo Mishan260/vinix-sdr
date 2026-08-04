@@ -38,6 +38,10 @@ export interface OnboardingSnapshot {
   dismissedAt: string | null;
   completedAt: string | null;
   valueProposition: string | null;
+  /** A quién se dirige la oferta. Opcional; mejora la puntería del agente. */
+  targetAudience: string | null;
+  /** Producto o servicio principal. Opcional. */
+  mainProduct: string | null;
   dismissedTips: string[];
 
   firstCampaignAt: string | null;
