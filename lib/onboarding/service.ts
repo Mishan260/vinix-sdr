@@ -123,13 +123,39 @@ export async function loadOnboarding(db: TypedSupabaseClient, userId: string): P
 const PROGRESS_COLUMNS =
   "welcomed_at, dismissed_at, completed_at, value_proposition, target_audience, main_product, dismissed_tips, first_campaign_at, first_lead_at, first_research_at, first_draft_at, first_send_at";
 
-/** Crea la fila de progreso si el trigger de alta no llegó a ejecutarse. */
+/**
+ * Crea la fila de progreso si el trigger de alta no llegó a ejecutarse.
+ *
+ * Se usa el cliente de servicio a propósito: `onboarding_progress` sólo tiene
+ * políticas de SELECT y UPDATE, así que el cliente del usuario no puede crear
+ * su propia fila. Sin esto, quien se registró sin el trigger `handle_new_user`
+ * se quedaba sin fila para siempre y TODO lo que escribía se perdía.
+ *
+ * No debilita nada: `userId` viene de la sesión ya verificada en `authedRoute`,
+ * nunca del cuerpo de la petición, y la fila creada está vacía.
+ */
 async function ensureProgressRow(db: TypedSupabaseClient, userId: string): Promise<OnboardingSnapshot> {
   const { error } = await db.from("onboarding_progress").insert({ user_id: userId });
+  if (!error) return EMPTY_SNAPSHOT;
+
   // 23505 = clave duplicada: otra petición simultánea ya la creó
-  if (error && error.code !== "23505") {
-    logger.warn("onboarding.progress_create_failed", { userId, dbError: error.message });
+  if (error.code === "23505") return EMPTY_SNAPSHOT;
+
+  try {
+    const { error: adminError } = await createServiceClient()
+      .from("onboarding_progress")
+      .upsert({ user_id: userId }, { onConflict: "user_id" });
+
+    if (adminError) throw adminError;
+  } catch (adminError) {
+    logger.warn("onboarding.progress_create_failed", {
+      userId,
+      dbError: error.message,
+      adminError,
+      consecuencia: "el progreso del usuario no se podrá guardar",
+    });
   }
+
   return EMPTY_SNAPSHOT;
 }
 
@@ -257,11 +283,27 @@ export interface ProgressPatch {
   dismissTip?: string;
 }
 
+/**
+ * Guarda el progreso del usuario.
+ *
+ * Devuelve `true` sólo si la escritura llegó realmente a la base de datos.
+ *
+ * REGRESIÓN QUE CIERRA: antes hacía `update().eq()`. Un UPDATE sobre una fila
+ * inexistente afecta a CERO filas y PostgREST lo devuelve como éxito, sin
+ * error. Como el trigger de alta no existía en este proyecto, ningún usuario
+ * tenía fila, así que cada escritura se descartaba en silencio:
+ *
+ *   · «Continuar» en el perfil → la oferta no se guardaba → la investigación
+ *     volvía a pedir el perfil → la misma pantalla en bucle.
+ *   · «Saltar» → `dismissed_at` seguía nulo → el panel rebotaba al recorrido.
+ *
+ * Ambos síntomas eran esta única línea.
+ */
 export async function updateProgress(
   db: TypedSupabaseClient,
   userId: string,
   patch: ProgressPatch
-): Promise<void> {
+): Promise<boolean> {
   // Tipado contra la tabla real: un nombre de columna equivocado no compila
   const update: TablesUpdate<"onboarding_progress"> = {};
   const now = new Date().toISOString();
@@ -288,12 +330,38 @@ export async function updateProgress(
     }
   }
 
-  if (Object.keys(update).length === 0) return;
+  if (Object.keys(update).length === 0) return true;
 
-  const { error } = await db.from("onboarding_progress").update(update).eq("user_id", userId);
+  // `.select()` es lo que convierte «no ha fallado» en «se ha escrito»: sin él
+  // no hay forma de distinguir un UPDATE correcto de uno que no tocó nada.
+  const { data, error } = await db
+    .from("onboarding_progress")
+    .update(update)
+    .eq("user_id", userId)
+    .select("user_id");
 
-  if (error) {
-    logger.warn("onboarding.progress_update_failed", { userId, dbError: error.message });
+  if (!error && data && data.length > 0) return true;
+
+  // Cero filas: la fila de progreso no existe. Se crea y se reintenta con el
+  // cliente de servicio, porque la tabla no tiene política de INSERT para el
+  // usuario. Ver `ensureProgressRow` para por qué esto no abre ningún agujero.
+  try {
+    const { error: adminError } = await createServiceClient()
+      .from("onboarding_progress")
+      .upsert({ user_id: userId, ...update }, { onConflict: "user_id" })
+      .select("user_id")
+      .single();
+
+    if (adminError) throw adminError;
+    return true;
+  } catch (adminError) {
+    logger.warn("onboarding.progress_update_failed", {
+      userId,
+      campos: Object.keys(update),
+      dbError: error?.message ?? "el UPDATE no afectó a ninguna fila",
+      adminError,
+    });
+    return false;
   }
 }
 

@@ -20,6 +20,17 @@ import { useToasts } from "@/lib/hooks/use-toasts";
 import { GUIDED_STEPS, SUGGESTED_COMPANIES, type GuidedStep } from "@/lib/onboarding/steps";
 import { PROFILE_QUESTIONS } from "@/lib/onboarding/profile";
 
+/** Respuesta de POST /api/onboarding: el estado ya recalculado. */
+interface ProgressResponse {
+  snapshot: {
+    welcomedAt: string | null;
+    dismissedAt: string | null;
+    valueProposition: string | null;
+    targetAudience: string | null;
+    mainProduct: string | null;
+  } | null;
+}
+
 interface TryResult {
   outcome: "drafted" | "no_hook";
   campaignId: string;
@@ -38,10 +49,12 @@ interface TryResult {
 function GuideContent() {
   const router = useRouter();
   const params = useSearchParams();
-  const { toasts, dismiss } = useToasts();
+  const { toasts, notify, dismiss } = useToasts();
 
   const [step, setStep] = useState<GuidedStep>("welcome");
   const [loadingState, setLoadingState] = useState(true);
+  /** Evita dobles pulsaciones en «Saltar» / «Ir a mi panel». */
+  const [leaving, setLeaving] = useState(false);
 
   /** Llega desde /auth/callback tras confirmar el email. */
   const verificado = params.get("verificado") === "1";
@@ -67,13 +80,41 @@ function GuideContent() {
   // Instante en que arrancó el recorrido: permite medir cuánto tarda cada paso
   const startedAt = useRef(new Date().toISOString());
 
-  const post = useCallback(async (payload: Record<string, unknown>) => {
-    const res = await fetch("/api/onboarding", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    return res.ok ? res.json() : null;
+  /** Último mensaje de error del servidor, para mostrarlo en vez de uno genérico. */
+  const lastPostError = useRef<string | null>(null);
+
+  /**
+   * El perfil se acaba de guardar y estamos reanudando la investigación.
+   * Si aun así el servidor lo vuelve a pedir, hay una inconsistencia real y
+   * repetir la pantalla sería el bucle que veía el usuario.
+   */
+  const profileJustSaved = useRef(false);
+
+  /**
+   * Guarda progreso y devuelve el estado recalculado por el servidor.
+   *
+   * Devuelve `null` si la escritura no llegó a la base de datos. Antes se
+   * descartaba también el mensaje del servidor, así que el usuario sólo veía
+   * que la pantalla no avanzaba, sin ninguna pista de por qué.
+   */
+  const post = useCallback(async (payload: Record<string, unknown>): Promise<ProgressResponse | null> => {
+    try {
+      const res = await fetch("/api/onboarding", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        lastPostError.current = typeof data?.error === "string" ? data.error : null;
+        return null;
+      }
+      lastPostError.current = null;
+      return data as ProgressResponse;
+    } catch {
+      lastPostError.current = null;
+      return null;
+    }
   }, []);
 
   // ── Estado inicial: retomar donde se dejó ─────────────────────────────────
@@ -139,7 +180,20 @@ function GuideContent() {
 
       if (!data) {
         setOfferError(
-          "No hemos podido guardar tus respuestas. Comprueba tu conexión e inténtalo de nuevo; no se ha perdido lo que has escrito."
+          lastPostError.current ??
+            "No hemos podido guardar tus respuestas. Comprueba tu conexión e inténtalo de nuevo; no se ha perdido lo que has escrito."
+        );
+        return;
+      }
+
+      // No basta con que el servidor responda 200: hay que comprobar que la
+      // oferta está REALMENTE en la base de datos antes de avanzar. Avanzar a
+      // ciegas era lo que producía el bucle: el paso siguiente releía el
+      // estado, no encontraba nada y devolvía a esta misma pantalla.
+      if (!data.snapshot?.valueProposition?.trim()) {
+        setOfferError(
+          "El servidor ha aceptado tus respuestas pero no las ha guardado. Vuelve a pulsar «Continuar»; " +
+            "lo que has escrito sigue aquí. Si se repite, es un problema de la base de datos y no de lo que has puesto."
         );
         return;
       }
@@ -151,6 +205,7 @@ function GuideContent() {
         setPendingCompany(null);
         setCompanyUrl(url);
         setStep("company");
+        profileJustSaved.current = true;
         await runResearch(url);
         return;
       }
@@ -190,11 +245,23 @@ function GuideContent() {
       // Falta el perfil: no es un fallo. Se guarda la empresa que pidió y se
       // le llevan las preguntas; al responder, la investigación se reanuda sola.
       if (data.outcome === "needs_profile") {
+        // Si ya venimos de contestar el perfil, volver a pedirlo sería el bucle
+        // otra vez. Se para aquí y se dice la verdad en lugar de repetir la
+        // misma pantalla indefinidamente.
+        if (profileJustSaved.current) {
+          profileJustSaved.current = false;
+          setCompanyError(
+            "Has respondido el perfil pero el servidor sigue sin encontrarlo. Recarga la página: " +
+              "si tras recargar tus respuestas siguen ahí, vuelve a pulsar «Investigar»."
+          );
+          return;
+        }
         setPendingCompany(data.pendingCompanyUrl ?? target);
         setStep("offer");
         return;
       }
 
+      profileJustSaved.current = false;
       setResult(data as TryResult);
       setStep("result");
       void post({ event: "draft_viewed", startedAt: startedAt.current });
@@ -209,12 +276,38 @@ function GuideContent() {
 
   // ── Cierre ────────────────────────────────────────────────────────────────
   async function finish() {
+    if (leaving) return;
+    setLeaving(true);
     await post({ complete: true, event: "onboarding_completed", startedAt: startedAt.current });
+    // Aquí sí se sale pase lo que pase: el usuario ya ha visto el resultado y
+    // no perder la marca de «completado» justifica retenerle.
     router.push("/dashboard");
   }
 
+  /**
+   * Abandonar el recorrido.
+   *
+   * Hay que ESPERAR a que `dismissed_at` quede escrito antes de navegar. El
+   * panel reenvía aquí a quien no lo ha descartado, así que salir sin haberlo
+   * guardado devolvía al usuario a esta misma pantalla: parecía que el botón
+   * «Saltar» no hacía nada.
+   */
   async function skip() {
-    await post({ dismiss: true, event: "onboarding_dismissed", startedAt: startedAt.current });
+    if (leaving) return;
+    setLeaving(true);
+
+    const data = await post({ dismiss: true, event: "onboarding_dismissed", startedAt: startedAt.current });
+
+    if (!data?.snapshot?.dismissedAt) {
+      setLeaving(false);
+      notify(
+        "error",
+        lastPostError.current ??
+          "No hemos podido guardar que quieres saltarte el recorrido, así que el panel te traería de vuelta aquí. Inténtalo otra vez."
+      );
+      return;
+    }
+
     router.push("/dashboard");
   }
 
@@ -278,7 +371,7 @@ function GuideContent() {
             </div>
           )}
 
-          {step === "welcome" && <WelcomeStep onStart={startGuide} onSkip={skip} />}
+          {step === "welcome" && <WelcomeStep onStart={startGuide} onSkip={skip} leaving={leaving} />}
 
           {step === "offer" && (
             <ProfileStep
@@ -289,6 +382,7 @@ function GuideContent() {
               pendingCompany={pendingCompany}
               onSubmit={submitProfile}
               onSkip={skip}
+              leaving={leaving}
             />
           )}
 
@@ -304,13 +398,16 @@ function GuideContent() {
                 void runResearch(url);
               }}
               onSkip={skip}
+              leaving={leaving}
             />
           )}
 
-          {step === "result" && result && <ResultStep result={result} onFinish={finish} />}
+          {step === "result" && result && (
+            <ResultStep result={result} onFinish={finish} leaving={leaving} />
+          )}
 
           {step === "result" && !result && (
-            <ResumedStep onFinish={finish} onRetry={() => setStep("company")} />
+            <ResumedStep onFinish={finish} onRetry={() => setStep("company")} leaving={leaving} />
           )}
         </div>
       </main>
@@ -325,8 +422,36 @@ function GuideContent() {
   );
 }
 
+/**
+ * Botón de abandono, idéntico en las tres pantallas.
+ *
+ * Se deshabilita mientras se guarda: descartar el recorrido es una escritura en
+ * la base de datos, y sin esta señal el botón parecía roto durante el viaje de
+ * ida y vuelta al servidor.
+ */
+function SkipButton({ onSkip, leaving }: { onSkip: () => void; leaving: boolean }) {
+  return (
+    <button
+      type="button"
+      onClick={onSkip}
+      disabled={leaving}
+      className="text-xs text-ink-subtle underline-offset-4 transition-colors hover:text-ink hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:no-underline"
+    >
+      {leaving ? "Saliendo…" : "Saltar"}
+    </button>
+  );
+}
+
 // ── Paso 1: bienvenida ──────────────────────────────────────────────────────
-function WelcomeStep({ onStart, onSkip }: { onStart: () => void; onSkip: () => void }) {
+function WelcomeStep({
+  onStart,
+  onSkip,
+  leaving,
+}: {
+  onStart: () => void;
+  onSkip: () => void;
+  leaving: boolean;
+}) {
   return (
     <div className="animate-rise-in text-center">
       <h1 className="text-display text-balance">
@@ -365,8 +490,13 @@ function WelcomeStep({ onStart, onSkip }: { onStart: () => void; onSkip: () => v
             <path d="M5 12h14M13 6l6 6-6 6" />
           </svg>
         </Button>
-        <button onClick={onSkip} className="text-xs text-ink-subtle underline-offset-4 hover:text-ink hover:underline">
-          Prefiero explorar por mi cuenta
+        <button
+          type="button"
+          onClick={onSkip}
+          disabled={leaving}
+          className="text-xs text-ink-subtle underline-offset-4 transition-colors hover:text-ink hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:no-underline"
+        >
+          {leaving ? "Saliendo…" : "Prefiero explorar por mi cuenta"}
         </button>
       </div>
     </div>
@@ -394,6 +524,7 @@ function ProfileStep({
   pendingCompany,
   onSubmit,
   onSkip,
+  leaving,
 }: {
   profile: CompanyProfileForm;
   onChange: (p: CompanyProfileForm) => void;
@@ -403,6 +534,7 @@ function ProfileStep({
   pendingCompany: string | null;
   onSubmit: () => void;
   onSkip: () => void;
+  leaving: boolean;
 }) {
   const set = (campo: keyof CompanyProfileForm) => (valor: string) =>
     onChange({ ...profile, [campo]: valor });
@@ -492,10 +624,8 @@ function ProfileStep({
       </div>
 
       <div className="mt-8 flex items-center justify-between gap-4">
-        <button onClick={onSkip} className="text-xs text-ink-subtle underline-offset-4 hover:text-ink hover:underline">
-          Saltar
-        </button>
-        <Button size="lg" onClick={onSubmit} disabled={pending}>
+        <SkipButton onSkip={onSkip} leaving={leaving} />
+        <Button size="lg" onClick={onSubmit} disabled={pending || leaving}>
           {pending && <Spinner className="h-4 w-4" />}
           {pending ? "Guardando…" : pendingCompany ? "Guardar y continuar" : "Continuar"}
         </Button>
@@ -513,6 +643,7 @@ function CompanyStep({
   onSubmit,
   onPick,
   onSkip,
+  leaving,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -521,6 +652,7 @@ function CompanyStep({
   onSubmit: () => void;
   onPick: (url: string) => void;
   onSkip: () => void;
+  leaving: boolean;
 }) {
   if (pending) return <ResearchingState />;
 
@@ -586,9 +718,7 @@ function CompanyStep({
       </div>
 
       <div className="mt-8">
-        <button onClick={onSkip} className="text-xs text-ink-subtle underline-offset-4 hover:text-ink hover:underline">
-          Saltar
-        </button>
+        <SkipButton onSkip={onSkip} leaving={leaving} />
       </div>
     </div>
   );
@@ -630,7 +760,15 @@ function ResearchingState() {
 }
 
 // ── Paso 4: el resultado ────────────────────────────────────────────────────
-function ResultStep({ result, onFinish }: { result: TryResult; onFinish: () => void }) {
+function ResultStep({
+  result,
+  onFinish,
+  leaving,
+}: {
+  result: TryResult;
+  onFinish: () => void;
+  leaving: boolean;
+}) {
   if (result.outcome === "no_hook") {
     return (
       <div className="animate-rise-in">
@@ -667,7 +805,8 @@ function ResultStep({ result, onFinish }: { result: TryResult; onFinish: () => v
         </div>
 
         <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-          <Button size="lg" onClick={onFinish} className="w-full sm:w-auto">
+          <Button size="lg" onClick={onFinish} disabled={leaving} className="w-full sm:w-auto">
+            {leaving && <Spinner className="h-4 w-4" />}
             Entendido, ir al panel
           </Button>
           <ButtonLink href="/bienvenida?paso=company" variant="secondary" size="lg" className="w-full sm:w-auto">
@@ -748,11 +887,15 @@ function ResultStep({ result, onFinish }: { result: TryResult; onFinish: () => v
       </div>
 
       <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-        <Button size="lg" onClick={onFinish} className="w-full sm:w-auto">
+        <Button size="lg" onClick={onFinish} disabled={leaving} className="w-full sm:w-auto">
           Ir a mi panel
-          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M5 12h14M13 6l6 6-6 6" />
-          </svg>
+          {leaving ? (
+            <Spinner className="h-4 w-4" />
+          ) : (
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 12h14M13 6l6 6-6 6" />
+            </svg>
+          )}
         </Button>
         <ButtonLink href="/bienvenida?paso=company" variant="secondary" size="lg" className="w-full sm:w-auto">
           Probar con otra empresa
@@ -763,7 +906,15 @@ function ResultStep({ result, onFinish }: { result: TryResult; onFinish: () => v
 }
 
 /** Se llega aquí al volver tras haber completado ya una investigación. */
-function ResumedStep({ onFinish, onRetry }: { onFinish: () => void; onRetry: () => void }) {
+function ResumedStep({
+  onFinish,
+  onRetry,
+  leaving,
+}: {
+  onFinish: () => void;
+  onRetry: () => void;
+  leaving: boolean;
+}) {
   return (
     <div className="animate-rise-in text-center">
       <h1 className="text-title text-balance text-ink">Ya has visto a Vinix trabajar</h1>
@@ -772,10 +923,11 @@ function ResumedStep({ onFinish, onRetry }: { onFinish: () => void; onRetry: () 
         tus leads y configurar el remitente.
       </p>
       <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
-        <Button size="lg" onClick={onFinish}>
+        <Button size="lg" onClick={onFinish} disabled={leaving}>
+          {leaving && <Spinner className="h-4 w-4" />}
           Ir a mi panel
         </Button>
-        <Button variant="secondary" size="lg" onClick={onRetry}>
+        <Button variant="secondary" size="lg" onClick={onRetry} disabled={leaving}>
           Probar otra empresa
         </Button>
       </div>

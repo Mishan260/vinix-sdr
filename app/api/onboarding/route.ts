@@ -6,6 +6,7 @@
 
 import { z } from "zod";
 import { authedRoute } from "@/lib/api/handler";
+import { errors } from "@/lib/errors";
 import { loadOnboarding, recordStep, updateProgress, type OnboardingStep } from "@/lib/onboarding/service";
 import { buildTasks, isComplete, progressOf, resumeAt, shouldRedirectToGuide } from "@/lib/onboarding/steps";
 
@@ -61,7 +62,7 @@ export const GET = authedRoute({ event: "onboarding.get", rateLimit: "read" }, a
 export const POST = authedRoute(
   { event: "onboarding.progress", body: progressSchema, rateLimit: "mutation" },
   async ({ body, db, user }) => {
-    await updateProgress(db, user.id, {
+    const saved = await updateProgress(db, user.id, {
       welcomedAt: body.markWelcomed,
       dismissedAt: body.dismiss,
       completedAt: body.complete,
@@ -70,6 +71,16 @@ export const POST = authedRoute(
       mainProduct: body.mainProduct,
       dismissTip: body.dismissTip,
     });
+
+    // Responder 200 sin haber escrito nada era lo que dejaba al usuario
+    // atrapado: el cliente avanzaba, el siguiente paso releía la base de datos,
+    // no encontraba nada y le devolvía a la misma pantalla.
+    if (!saved) {
+      throw errors.config(
+        "No hemos podido guardar tus respuestas. No se ha perdido lo que has escrito: " +
+          "vuelve a intentarlo en un momento y, si sigue igual, escríbenos."
+      );
+    }
 
     if (body.event) {
       await recordStep(user.id, body.event, { startedAt: body.startedAt });

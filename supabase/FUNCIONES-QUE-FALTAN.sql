@@ -23,6 +23,14 @@
 alter table onboarding_progress add column if not exists target_audience text;
 alter table onboarding_progress add column if not exists main_product text;
 
+-- ── Política de INSERT que faltaba (migración 0011) ─────────────────────────
+-- Sin ella el usuario no podía crear su fila de progreso, y un UPDATE sobre
+-- una fila inexistente afecta a cero filas devolviendo éxito: todo lo que
+-- escribía en el recorrido guiado se descartaba en silencio.
+drop policy if exists "onboarding_insert_own" on onboarding_progress;
+create policy "onboarding_insert_own" on onboarding_progress
+  for insert with check (auth.uid() = user_id);
+
 -- ── Alta automática de cuenta y progreso al registrarse ─────────────────────
 -- Sin este trigger, cada usuario nuevo se queda sin fila en `accounts` y el
 -- plan cae a Free (1 campaña) sin explicación.
@@ -208,4 +216,11 @@ union all select 'usuarios sin fila en accounts',
        then 'OK' else 'QUEDAN' end
 union all select 'onboarding_progress.target_audience',
   case when exists (select 1 from information_schema.columns
-    where table_name='onboarding_progress' and column_name='target_audience') then 'OK' else 'FALTA' end;
+    where table_name='onboarding_progress' and column_name='target_audience') then 'OK' else 'FALTA' end
+union all select 'politica onboarding_insert_own',
+  case when exists (select 1 from pg_policies
+    where tablename='onboarding_progress' and policyname='onboarding_insert_own') then 'OK' else 'FALTA' end
+union all select 'usuarios sin fila en onboarding_progress',
+  case when (select count(*) from auth.users u
+             where not exists (select 1 from onboarding_progress p where p.user_id=u.id)) = 0
+       then 'OK' else 'QUEDAN' end;
