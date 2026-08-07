@@ -303,7 +303,7 @@ export async function updateProgress(
   db: TypedSupabaseClient,
   userId: string,
   patch: ProgressPatch
-): Promise<boolean> {
+): Promise<ProgressWriteResult> {
   // Tipado contra la tabla real: un nombre de columna equivocado no compila
   const update: TablesUpdate<"onboarding_progress"> = {};
   const now = new Date().toISOString();
@@ -330,7 +330,7 @@ export async function updateProgress(
     }
   }
 
-  if (Object.keys(update).length === 0) return true;
+  if (Object.keys(update).length === 0) return { ok: true };
 
   // `.select()` es lo que convierte «no ha fallado» en «se ha escrito»: sin él
   // no hay forma de distinguir un UPDATE correcto de uno que no tocó nada.
@@ -340,29 +340,61 @@ export async function updateProgress(
     .eq("user_id", userId)
     .select("user_id");
 
-  if (!error && data && data.length > 0) return true;
+  if (!error && data && data.length > 0) return { ok: true };
 
   // Cero filas: la fila de progreso no existe. Se crea y se reintenta con el
   // cliente de servicio, porque la tabla no tiene política de INSERT para el
   // usuario. Ver `ensureProgressRow` para por qué esto no abre ningún agujero.
+  let adminError: unknown = null;
   try {
-    const { error: adminError } = await createServiceClient()
+    const { error: upsertError } = await createServiceClient()
       .from("onboarding_progress")
       .upsert({ user_id: userId, ...update }, { onConflict: "user_id" })
       .select("user_id")
       .single();
 
-    if (adminError) throw adminError;
-    return true;
-  } catch (adminError) {
-    logger.warn("onboarding.progress_update_failed", {
-      userId,
-      campos: Object.keys(update),
-      dbError: error?.message ?? "el UPDATE no afectó a ninguna fila",
-      adminError,
-    });
-    return false;
+    if (!upsertError) return { ok: true };
+    adminError = upsertError;
+  } catch (thrown) {
+    adminError = thrown;
   }
+
+  const reason = classifyWriteFailure(error ?? adminError);
+
+  logger.error("onboarding.progress_update_failed", {
+    userId,
+    campos: Object.keys(update),
+    motivo: reason,
+    dbError: error?.message ?? "el UPDATE no afectó a ninguna fila",
+    adminError,
+  });
+
+  return { ok: false, reason };
+}
+
+/**
+ * Por qué no se pudo escribir.
+ *
+ * Importa distinguirlo porque cambia lo que se le puede pedir al usuario:
+ * ante un fallo pasajero tiene sentido decirle «inténtalo otra vez», pero si
+ * falta la tabla reintentar no servirá nunca y decírselo es engañarle.
+ */
+export type ProgressWriteFailure = "schema_missing" | "denied" | "unknown";
+export type ProgressWriteResult = { ok: true } | { ok: false; reason: ProgressWriteFailure };
+
+function classifyWriteFailure(error: unknown): ProgressWriteFailure {
+  const code = (error as { code?: string } | null)?.code ?? "";
+  const message = ((error as { message?: string } | null)?.message ?? "").toLowerCase();
+
+  // PGRST205/PGRST204: PostgREST no encuentra la tabla o la columna.
+  // 42P01/42703: Postgres dice lo mismo. 0002–0011 sin aplicar.
+  if (["PGRST205", "PGRST204", "42P01", "42703"].includes(code)) return "schema_missing";
+  if (message.includes("schema cache") || message.includes("does not exist")) return "schema_missing";
+
+  // 42501: RLS. La política de INSERT de la migración 0011 no está.
+  if (code === "42501" || message.includes("row-level security")) return "denied";
+
+  return "unknown";
 }
 
 /**

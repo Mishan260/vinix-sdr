@@ -1,0 +1,56 @@
+
+
+-- ============================================================================
+-- VERIFICACIÓN — todas las filas deben decir OK
+-- ============================================================================
+
+notify pgrst, 'reload schema';
+
+with comprobaciones as (
+  select 'tabla accounts' as objeto,
+    exists (select 1 from information_schema.tables
+            where table_schema='public' and table_name='accounts') as ok
+  union all select 'tabla subscriptions',
+    exists (select 1 from information_schema.tables
+            where table_schema='public' and table_name='subscriptions')
+  union all select 'tabla webhook_events',
+    exists (select 1 from information_schema.tables
+            where table_schema='public' and table_name='webhook_events')
+  union all select 'tabla onboarding_progress',
+    exists (select 1 from information_schema.tables
+            where table_schema='public' and table_name='onboarding_progress')
+  union all select 'tabla onboarding_events',
+    exists (select 1 from information_schema.tables
+            where table_schema='public' and table_name='onboarding_events')
+  union all select 'columna campaigns.is_demo',
+    exists (select 1 from information_schema.columns
+            where table_name='campaigns' and column_name='is_demo')
+  union all select 'columna onboarding_progress.target_audience',
+    exists (select 1 from information_schema.columns
+            where table_name='onboarding_progress' and column_name='target_audience')
+  union all select 'columna onboarding_progress.main_product',
+    exists (select 1 from information_schema.columns
+            where table_name='onboarding_progress' and column_name='main_product')
+  union all select 'funcion account_overview',
+    exists (select 1 from pg_proc where proname='account_overview')
+  union all select 'funcion onboarding_overview',
+    exists (select 1 from pg_proc where proname='onboarding_overview')
+  union all select 'funcion claim_webhook_event',
+    exists (select 1 from pg_proc where proname='claim_webhook_event')
+  union all select 'funcion claim_orphan_data',
+    exists (select 1 from pg_proc where proname='claim_orphan_data')
+  union all select 'trigger de alta de usuario',
+    exists (select 1 from pg_trigger where tgname='trg_auth_user_created')
+  union all select 'politica onboarding_insert_own',
+    exists (select 1 from pg_policies
+            where tablename='onboarding_progress' and policyname='onboarding_insert_own')
+  union all select 'todos los usuarios tienen fila en accounts',
+    (select count(*) from auth.users u
+      where not exists (select 1 from accounts a where a.user_id=u.id)) = 0
+  union all select 'todos los usuarios tienen fila en onboarding_progress',
+    (select count(*) from auth.users u
+      where not exists (select 1 from onboarding_progress p where p.user_id=u.id)) = 0
+)
+select objeto, case when ok then 'OK' else '>>> FALTA <<<' end as estado
+from comprobaciones
+order by ok, objeto;

@@ -1,0 +1,32 @@
+-- ============================================================================
+-- PONER AL DÍA LA BASE DE DATOS — proyecto riygxhnrmarvkvrieijd
+--
+-- ESTADO MEDIDO el 2026-08-04 contra la base de datos real, no supuesto:
+--
+--   TABLAS QUE EXISTEN:  campaigns, leads, emails_sent, replies
+--                        + `account` (en singular, de una versión antigua)
+--   TABLAS QUE FALTAN:   accounts, subscriptions, webhook_events,
+--                        onboarding_progress, onboarding_events
+--   FUNCIONES:           ninguna
+--
+-- Es decir: sólo llegó a aplicarse la migración 0001. Todo lo demás falta.
+--
+-- CONSECUENCIA OBSERVADA: al pulsar «Continuar» en el perfil de empresa, la
+-- escritura iba contra una tabla inexistente. Antes eso se descartaba en
+-- silencio y la pantalla se repetía en bucle; ahora la aplicación lo dice.
+--
+-- ESTE FICHERO SE GENERA. No lo edites a mano: sale de concatenar las
+-- migraciones 0002 a 0011 con `node supabase/build-al-dia.mjs`.
+--
+-- CÓMO USARLO
+--   Supabase → SQL Editor → New query → pegar todo → Run.
+--   Tarda unos segundos. Al final imprime una tabla de verificación donde
+--   todas las filas deben decir OK.
+--
+-- ES SEGURO: todo usa `if not exists`, `create or replace` y
+-- `drop ... if exists`, así que se puede ejecutar las veces que haga falta.
+-- No borra ni modifica ninguno de tus datos actuales.
+--
+-- La tabla `account` en singular NO se toca: no la usa el código y borrarla
+-- es una decisión tuya, no mía.
+-- ============================================================================

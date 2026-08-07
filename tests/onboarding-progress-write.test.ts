@@ -31,7 +31,9 @@ const { updateProgress } = await import("@/lib/onboarding/service");
 const USER = "55555555-5555-5555-5555-555555555555";
 
 /** Doble del cliente de servicio: registra el upsert y decide si funciona. */
-function serviceStub(options: { works: boolean } = { works: true }) {
+function serviceStub(
+  options: { works: boolean; error?: { code: string; message: string } } = { works: true }
+) {
   const calls: { table: string; values: unknown }[] = [];
 
   serviceFrom.mockImplementation((table: string) => ({
@@ -39,7 +41,10 @@ function serviceStub(options: { works: boolean } = { works: true }) {
       calls.push({ table, values });
       const result = options.works
         ? { data: { user_id: USER }, error: null }
-        : { data: null, error: { code: "42501", message: "row-level security" } };
+        : {
+            data: null,
+            error: options.error ?? { code: "42501", message: "row-level security" },
+          };
       const chain = {
         select: () => chain,
         single: () => Promise.resolve(result),
@@ -63,11 +68,11 @@ describe("updateProgress cuando la fila SÍ existe", () => {
       onboarding_progress: { rows: [{ user_id: USER }] },
     });
 
-    const ok = await updateProgress(client.asClient, USER, {
+    const result = await updateProgress(client.asClient, USER, {
       valueProposition: "Auditamos infraestructura cloud",
     });
 
-    expect(ok).toBe(true);
+    expect(result.ok).toBe(true);
     // El camino normal usa el cliente del usuario: RLS sigue aplicándose
     expect(calls).toHaveLength(0);
   });
@@ -111,12 +116,12 @@ describe("updateProgress cuando la fila NO existe", () => {
     // Sin filas: es exactamente el estado del proyecto sin el trigger de alta
     const client = createCountingClient({ onboarding_progress: { rows: [] } });
 
-    const ok = await updateProgress(client.asClient, USER, {
+    const result = await updateProgress(client.asClient, USER, {
       valueProposition: "Auditamos infraestructura cloud",
     });
 
     // Antes esto devolvía éxito sin haber escrito nada: el bucle empezaba aquí
-    expect(ok).toBe(true);
+    expect(result.ok).toBe(true);
     expect(calls).toHaveLength(1);
     expect(calls[0].table).toBe("onboarding_progress");
   });
@@ -133,16 +138,67 @@ describe("updateProgress cuando la fila NO existe", () => {
     expect(values.dismissed_at).toBeTypeOf("string");
   });
 
-  it("devuelve false si tampoco se puede crear la fila", async () => {
+  it("informa del fallo si tampoco se puede crear la fila", async () => {
     serviceStub({ works: false });
     const client = createCountingClient({ onboarding_progress: { rows: [] } });
 
-    const ok = await updateProgress(client.asClient, USER, { dismissedAt: true });
+    const result = await updateProgress(client.asClient, USER, { dismissedAt: true });
 
     // Mentir aquí es lo que dejaba al usuario atrapado: la ruta necesita saber
     // que no se guardó para poder decírselo en lugar de avanzar a ciegas.
-    expect(ok).toBe(false);
+    expect(result.ok).toBe(false);
   });
+});
+
+// ── Clasificación del fallo ─────────────────────────────────────────────────
+// Importa porque decide qué se le dice al usuario. Ante un fallo pasajero
+// tiene sentido pedirle que reintente; si faltan tablas, reintentar no va a
+// funcionar nunca y decírselo sería mandarle a dar vueltas.
+describe("por qué falló la escritura", () => {
+  const casos: { nombre: string; error: { code: string; message: string }; esperado: string }[] = [
+    {
+      nombre: "PostgREST no encuentra la tabla",
+      error: { code: "PGRST205", message: "Could not find the table 'public.onboarding_progress'" },
+      esperado: "schema_missing",
+    },
+    {
+      nombre: "PostgREST no encuentra la columna",
+      error: { code: "PGRST204", message: "Could not find the 'target_audience' column" },
+      esperado: "schema_missing",
+    },
+    {
+      nombre: "Postgres: la relación no existe",
+      error: { code: "42P01", message: 'relation "onboarding_progress" does not exist' },
+      esperado: "schema_missing",
+    },
+    {
+      nombre: "Postgres: la columna no existe",
+      error: { code: "42703", message: 'column "main_product" does not exist' },
+      esperado: "schema_missing",
+    },
+    {
+      nombre: "RLS rechaza la escritura",
+      error: { code: "42501", message: "new row violates row-level security policy" },
+      esperado: "denied",
+    },
+    {
+      nombre: "cualquier otra cosa",
+      error: { code: "08006", message: "connection failure" },
+      esperado: "unknown",
+    },
+  ];
+
+  for (const caso of casos) {
+    it(`${caso.nombre} → ${caso.esperado}`, async () => {
+      serviceStub({ works: false, error: caso.error });
+      const client = createCountingClient({ onboarding_progress: { rows: [] } });
+
+      const result = await updateProgress(client.asClient, USER, { dismissedAt: true });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe(caso.esperado);
+    });
+  }
 });
 
 describe("updateProgress sin nada que escribir", () => {
@@ -150,9 +206,9 @@ describe("updateProgress sin nada que escribir", () => {
     serviceStub();
     const client = createCountingClient({ onboarding_progress: { rows: [] } });
 
-    const ok = await updateProgress(client.asClient, USER, {});
+    const result = await updateProgress(client.asClient, USER, {});
 
-    expect(ok).toBe(true);
+    expect(result.ok).toBe(true);
     expect(client.count).toBe(0);
   });
 
